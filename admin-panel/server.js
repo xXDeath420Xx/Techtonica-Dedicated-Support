@@ -411,11 +411,20 @@ function getSaveFiles() {
     }
 }
 
-// Check if server is actually running
+// Check if server is actually running and get process info
 function checkServerRunning() {
     return new Promise((resolve) => {
-        exec('pgrep -f "wine.*Techtonica"', (err, stdout) => {
-            resolve(stdout.trim() !== '');
+        // Find Techtonica.exe process with -batchmode (the server)
+        exec('ps -eo pid,etimes,args | grep "Techtonica.exe.*-batchmode" | grep -v grep | head -1', (err, stdout) => {
+            const line = stdout.trim();
+            if (!line) {
+                resolve({ running: false, pid: null, uptime: 0 });
+                return;
+            }
+            const parts = line.trim().split(/\s+/);
+            const pid = parseInt(parts[0]) || null;
+            const uptime = parseInt(parts[1]) || 0; // etimes = elapsed time in seconds
+            resolve({ running: true, pid, uptime });
         });
     });
 }
@@ -427,20 +436,20 @@ function checkServerRunning() {
 // Get server status
 app.get('/api/status', requireAuth, async (req, res) => {
     const config = parseConfig();
-    const isRunning = await checkServerRunning();
+    const serverInfo = await checkServerRunning();
 
-    if (isRunning && serverStatus !== 'running') {
+    if (serverInfo.running && serverStatus !== 'running') {
         serverStatus = 'running';
-    } else if (!isRunning && serverStatus === 'running') {
+    } else if (!serverInfo.running && serverStatus === 'running') {
         serverStatus = 'stopped';
         serverProcess = null;
     }
 
     res.json({
-        status: serverStatus,
-        pid: serverProcess?.pid || null,
+        status: serverInfo.running ? 'running' : serverStatus,
+        pid: serverInfo.pid || serverProcess?.pid || null,
         config: config,
-        uptime: serverStartTime ? Math.floor((Date.now() - serverStartTime) / 1000) : 0,
+        uptime: serverInfo.uptime || (serverStartTime ? Math.floor((Date.now() - serverStartTime) / 1000) : 0),
         serverAddress: '51.81.155.59:6968'
     });
 });
@@ -483,8 +492,8 @@ app.get('/api/saves', requireAuth, (req, res) => {
 
 // Start server
 app.post('/api/server/start', requireAuth, async (req, res) => {
-    const isRunning = await checkServerRunning();
-    if (isRunning) {
+    const serverInfo = await checkServerRunning();
+    if (serverInfo.running) {
         serverStatus = 'running';
         return res.json({ success: false, message: 'Server is already running' });
     }
