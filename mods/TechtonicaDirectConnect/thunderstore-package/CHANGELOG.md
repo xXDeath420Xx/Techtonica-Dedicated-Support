@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.35
+- **DEBUG**: Added HEARTBEAT log every 5 seconds in Update()
+- Shows frame count, monitor state, timer, and finishCalled status
+- This will confirm if Update() is still running after the NRE
+
 ## 1.0.34
 - **DEBUG**: Added logging at every exit point in CheckLoadingMonitor
 - Logs when NetworkClient becomes inactive

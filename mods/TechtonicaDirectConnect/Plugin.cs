@@ -95,14 +95,25 @@ namespace TechtonicaDirectConnect
             Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] Press F11 to open connect dialog");
         }
 
+        // Heartbeat counter for Update
+        private static int _updateHeartbeat = 0;
+
         // Update runs directly on the plugin (like ConsoleCommands mod)
         private void Update()
         {
+            _updateHeartbeat++;
+
             // Log once to confirm Update is running
             if (!_updateRunning)
             {
                 _updateRunning = true;
                 Log.LogInfo("[DirectConnect] Update() is running!");
+            }
+
+            // Heartbeat log every 5 seconds (300 frames at 60fps)
+            if (_updateHeartbeat % 300 == 0 && NetworkClient.active)
+            {
+                Log.LogInfo($"[DirectConnect] HEARTBEAT: frame={_updateHeartbeat}, monitorActive={_loadingMonitorActive}, timer={_loadingStuckTimer:F1}s, finishCalled={_finishLoadingCalled}");
             }
 
             // Try Unity's Input first (works for some keys even with Rewired)
@@ -930,7 +941,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.34";
+        public const string PLUGIN_VERSION = "1.0.35";
     }
 
     /// <summary>
