@@ -1,10 +1,61 @@
 # Changelog
 
+## 1.0.29
+- **FIX**: Fixed NullReferenceException when connecting to dedicated servers
+- Added RequestCurrentSimTick_Prefix to handle null NetworkMessageRelay.instance
+- Added RequestCurrentSimTick_Finalizer to catch exceptions and complete loading
+- Calls LoadingUI.OnFinishLoading() directly when server doesn't have NetworkMessageRelay
+- Fixes "Generating Machines" loading screen freeze when joining dedicated servers
+
+## 1.0.26
+- **CRITICAL FIX**: Removed NetworkedPlayer patches that were breaking save sync!
+- Client was skipping OnStartLocalPlayer which prevented RequestInitialSaveData() from being called
+- Server was never receiving the client's request for world data (causing "Timing out for strata")
+- Now properly receives save/world data from server
+
+## 1.0.25
+- **CRITICAL FIX**: Set NetworkManager.networkAddress BEFORE calling JoinGameAsClient
+- The game was trying to connect but didn't know where (caused timeout)
+- Removed redundant ConnectAfterSceneLoad coroutine - game handles connection internally
+
+## 1.0.24
+- Patched FizzyFacepunch (Steam transport) to prevent NullReferenceException spam
+- Disabled FizzyFacepunch.ClientEarlyUpdate/ClientLateUpdate/ServerEarlyUpdate/ServerLateUpdate
+- Enables KCP transport before calling JoinGameAsClient to prevent Steam transport errors
+- Now works without Steam networking active!
+
+## 1.0.23
+- Fixed FlowManager.JoinGameAsClient call - now calls it directly instead of via reflection
+- Properly loads game scenes when connecting from main menu
+- Removed unnecessary instance check that was causing "FlowManager.instance is null" error
+
+## 1.0.22
+- **NEW: "Join Multiplayer" button in main menu!** Uses the game's hidden button (no more F11 required)
+- Patched MainMenuUI.RefreshHiddenButtonState to show the multiplayer button
+- Patched MainMenuUI.JoinMultiplayerAsClient to show our connection dialog
+- Added Assembly-CSharp reference for direct game type access
+- F11 hotkey still works as a fallback
+
+## 1.0.21
+- Added join-from-main-menu support using FlowManager.JoinGameAsClient
+- Pressing F11 and Connect from main menu now automatically loads game scenes
+- Added DoConnect helper to reduce code duplication
+- Added ConnectAfterSceneLoad and WaitForGameWorldAndConnect coroutines
+- No longer requires loading a save first - connects like joining a friend!
+
+## 1.0.20
+- Added patch for NetworkMessageRelay.SendNetworkAction
+- Suppresses NullReferenceException when quest system tries to send network actions
+- Fixes error spam when playing in single player before connecting
+
+## 1.0.19
+- Fixed crash when connecting from main menu
+- Simplified scene detection - just warns user instead of trying auto-load
+- Clear message: "Load a game first, then press F11"
+
 ## 1.0.18
 - Added scene detection - checks if you're in game world before connecting
-- Attempts to trigger JoinMultiplayerAsClient if connecting from main menu
 - Logs all loaded scenes for debugging
-- Shows helpful message if not in game world
 
 ## 1.0.17
 - Added patches for NetworkedPlayer.OnStartClient() and OnStartLocalPlayer()

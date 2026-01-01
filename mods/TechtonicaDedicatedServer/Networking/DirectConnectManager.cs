@@ -1,6 +1,8 @@
 using System;
+using System.IO;
 using System.Net;
 using System.Reflection;
+using System.Collections.Generic;
 using Mirror;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -19,6 +21,8 @@ namespace TechtonicaDedicatedServer.Networking
         private static bool _isInitialized;
         private static bool _isDirectConnectActive;
         private static DirectConnectLobbyConnector _directConnectLobby;
+        private static Dictionary<int, PlayerInfo> _connectedPlayers = new Dictionary<int, PlayerInfo>();
+        private static string _eventLogPath = "/home/death/techtonica-server/events.log";
 
         public static bool IsDirectConnectActive => _isDirectConnectActive;
         public static bool IsServer => NetworkServer.active;
@@ -30,6 +34,16 @@ namespace TechtonicaDedicatedServer.Networking
         public static event Action OnClientConnected;
         public static event Action OnClientDisconnected;
 
+        public class PlayerInfo
+        {
+            public int ConnectionId { get; set; }
+            public string Name { get; set; }
+            public DateTime ConnectedAt { get; set; }
+            public string Address { get; set; }
+        }
+
+        public static IReadOnlyDictionary<int, PlayerInfo> ConnectedPlayers => _connectedPlayers;
+
         public static void Initialize()
         {
             if (_isInitialized) return;
@@ -37,6 +51,35 @@ namespace TechtonicaDedicatedServer.Networking
             Plugin.Log.LogInfo("[DirectConnect] Initializing...");
             _isInitialized = true;
             Plugin.Log.LogInfo("[DirectConnect] Initialized successfully");
+        }
+
+        /// <summary>
+        /// Writes an event to the event log file for the admin panel to read.
+        /// </summary>
+        public static void WriteEvent(string eventType, string message, Dictionary<string, string> data = null)
+        {
+            try
+            {
+                var timestamp = DateTime.UtcNow.ToString("O");
+                var dataStr = "";
+                if (data != null)
+                {
+                    var parts = new List<string>();
+                    foreach (var kvp in data)
+                    {
+                        parts.Add($"\"{kvp.Key}\":\"{kvp.Value}\"");
+                    }
+                    dataStr = string.Join(",", parts);
+                }
+
+                var logLine = $"{{\"timestamp\":\"{timestamp}\",\"type\":\"{eventType}\",\"message\":\"{message}\"{(dataStr.Length > 0 ? "," + dataStr : "")}}}\n";
+                File.AppendAllText(_eventLogPath, logLine);
+                Plugin.Log.LogInfo($"[Events] {eventType}: {message}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[Events] Failed to write event: {ex.Message}");
+            }
         }
 
         public static void Cleanup()
@@ -236,15 +279,52 @@ namespace TechtonicaDedicatedServer.Networking
                     }
                 }
 
-                // Register callback for when clients connect
+                // Register callbacks for client connect/disconnect
                 NetworkServer.OnConnectedEvent += HandleClientConnect;
+                NetworkServer.OnDisconnectedEvent += HandleClientDisconnect;
 
                 // Start server only (not host)
                 networkManager.StartServer();
 
+                // CRITICAL: Spawn scene network objects
+                // When using StartServer() instead of StartHost(), scene objects with NetworkIdentity
+                // (like NetworkMessageRelay) need to be explicitly spawned
+                if (NetworkServer.active)
+                {
+                    Plugin.Log.LogInfo("[DirectConnect] Spawning scene network objects...");
+                    NetworkServer.SpawnObjects();
+
+                    // Check for critical network objects
+                    var networkMessageRelayType = AccessTools.TypeByName("NetworkMessageRelay");
+                    if (networkMessageRelayType != null)
+                    {
+                        var instanceField = networkMessageRelayType.GetField("instance",
+                            BindingFlags.Public | BindingFlags.Static);
+                        var relay = instanceField?.GetValue(null);
+                        if (relay != null)
+                        {
+                            Plugin.Log.LogInfo("[DirectConnect] NetworkMessageRelay.instance found!");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning("[DirectConnect] NetworkMessageRelay.instance is NULL - clients may have issues");
+                        }
+                    }
+
+                    Plugin.Log.LogInfo("[DirectConnect] Scene objects spawned");
+                }
+
                 Plugin.Log.LogInfo($"[DirectConnect] Server started on port {Plugin.ServerPort.Value}");
                 Plugin.Log.LogInfo($"[DirectConnect] Max players: {Plugin.MaxPlayers.Value}");
                 Plugin.Log.LogInfo($"[DirectConnect] Address: {GetServerAddress()}");
+
+                // Write event for admin panel
+                WriteEvent("server_start", "Server started", new Dictionary<string, string>
+                {
+                    { "port", Plugin.ServerPort.Value.ToString() },
+                    { "maxPlayers", Plugin.MaxPlayers.Value.ToString() },
+                    { "address", GetServerAddress() }
+                });
 
                 OnServerStarted?.Invoke();
                 return true;
@@ -356,6 +436,31 @@ namespace TechtonicaDedicatedServer.Networking
                     }
                 }
 
+                // Resolve DNS if hostname is not an IP address
+                if (!System.Net.IPAddress.TryParse(host, out _))
+                {
+                    try
+                    {
+                        Plugin.Log.LogInfo($"[DirectConnect] Resolving hostname: {host}");
+                        var addresses = Dns.GetHostAddresses(host);
+                        foreach (var addr in addresses)
+                        {
+                            if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            {
+                                var resolvedIp = addr.ToString();
+                                Plugin.Log.LogInfo($"[DirectConnect] Resolved {host} -> {resolvedIp}");
+                                host = resolvedIp;
+                                break;
+                            }
+                        }
+                    }
+                    catch (Exception dnsEx)
+                    {
+                        Plugin.Log.LogError($"[DirectConnect] DNS resolution failed for {host}: {dnsEx.Message}");
+                        // Continue anyway - let the transport try to resolve it
+                    }
+                }
+
                 // Update KCP port
                 if (_kcpTransport != null)
                 {
@@ -387,8 +492,9 @@ namespace TechtonicaDedicatedServer.Networking
         {
             try
             {
-                // Unregister event handler
+                // Unregister event handlers
                 NetworkServer.OnConnectedEvent -= HandleClientConnect;
+                NetworkServer.OnDisconnectedEvent -= HandleClientDisconnect;
 
                 var networkManager = NetworkManager.singleton;
                 if (networkManager == null) return;
@@ -398,12 +504,16 @@ namespace TechtonicaDedicatedServer.Networking
                 {
                     networkManager.StopHost();
                     Plugin.Log.LogInfo("[DirectConnect] Host stopped");
+                    WriteEvent("server_stop", "Host stopped");
+                    _connectedPlayers.Clear();
                     OnServerStopped?.Invoke();
                 }
                 else if (IsServer)
                 {
                     networkManager.StopServer();
                     Plugin.Log.LogInfo("[DirectConnect] Server stopped");
+                    WriteEvent("server_stop", "Server stopped");
+                    _connectedPlayers.Clear();
                     OnServerStopped?.Invoke();
                 }
                 else if (IsClient)
@@ -424,10 +534,17 @@ namespace TechtonicaDedicatedServer.Networking
 
         /// <summary>
         /// Gets the server's network address for players to connect.
+        /// Uses PublicAddress config if set, otherwise falls back to local detection.
         /// </summary>
         public static string GetServerAddress()
         {
             if (!IsServer) return null;
+
+            // Use configured public address if set
+            if (!string.IsNullOrEmpty(Plugin.PublicAddress?.Value))
+            {
+                return Plugin.PublicAddress.Value;
+            }
 
             try
             {
@@ -471,7 +588,26 @@ namespace TechtonicaDedicatedServer.Networking
         {
             try
             {
-                Plugin.Log.LogInfo($"[DirectConnect] Client connected: {conn.connectionId}");
+                var address = conn.address ?? "unknown";
+                Plugin.Log.LogInfo($"[DirectConnect] Client connected: {conn.connectionId} from {address}");
+
+                // Track player
+                var playerInfo = new PlayerInfo
+                {
+                    ConnectionId = conn.connectionId,
+                    Name = $"Player_{conn.connectionId}", // Will be updated when we get their actual name
+                    ConnectedAt = DateTime.UtcNow,
+                    Address = address
+                };
+                _connectedPlayers[conn.connectionId] = playerInfo;
+
+                // Write event for admin panel
+                WriteEvent("player_connect", $"Player connected from {address}", new Dictionary<string, string>
+                {
+                    { "connectionId", conn.connectionId.ToString() },
+                    { "address", address },
+                    { "playerCount", GetPlayerCount().ToString() }
+                });
 
                 // Get current scene
                 var currentScene = SceneManager.GetActiveScene().name;
@@ -492,6 +628,63 @@ namespace TechtonicaDedicatedServer.Networking
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"[DirectConnect] Error handling client connect: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Called when a client disconnects from the server.
+        /// </summary>
+        private static void HandleClientDisconnect(NetworkConnection conn)
+        {
+            try
+            {
+                var playerName = "Unknown";
+                var connectedFor = "";
+
+                if (_connectedPlayers.TryGetValue(conn.connectionId, out var playerInfo))
+                {
+                    playerName = playerInfo.Name;
+                    var duration = DateTime.UtcNow - playerInfo.ConnectedAt;
+                    connectedFor = $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
+                    _connectedPlayers.Remove(conn.connectionId);
+                }
+
+                Plugin.Log.LogInfo($"[DirectConnect] Client disconnected: {conn.connectionId} ({playerName})");
+
+                // Write event for admin panel
+                WriteEvent("player_disconnect", $"{playerName} disconnected", new Dictionary<string, string>
+                {
+                    { "connectionId", conn.connectionId.ToString() },
+                    { "playerName", playerName },
+                    { "connectedFor", connectedFor },
+                    { "playerCount", GetPlayerCount().ToString() }
+                });
+
+                OnClientDisconnected?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] Error handling client disconnect: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Updates a player's name (called when we learn their actual in-game name).
+        /// </summary>
+        public static void UpdatePlayerName(int connectionId, string name)
+        {
+            if (_connectedPlayers.TryGetValue(connectionId, out var playerInfo))
+            {
+                var oldName = playerInfo.Name;
+                playerInfo.Name = name;
+                Plugin.Log.LogInfo($"[DirectConnect] Player {connectionId} identified as: {name}");
+
+                WriteEvent("player_identified", $"{name} joined the game", new Dictionary<string, string>
+                {
+                    { "connectionId", connectionId.ToString() },
+                    { "name", name },
+                    { "playerCount", GetPlayerCount().ToString() }
+                });
             }
         }
     }

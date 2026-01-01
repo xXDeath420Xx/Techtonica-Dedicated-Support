@@ -17,12 +17,81 @@ namespace TechtonicaDedicatedServer.Networking
         private static bool _hasAttemptedAutoLoad;
         private static bool _isAutoLoading;
 
+        // Server start scheduling (must happen on main thread)
+        private static bool _serverStartPending;
+        private static float _serverStartScheduledTime;
+
         // Cached save data for sending to clients (used when PrepSave fails in headless mode)
         private static string _cachedSaveString;
         private static byte[] _cachedSaveBytes;
         private static string _lastLoadedSavePath;
 
         public static bool IsAutoLoading => _isAutoLoading;
+
+        private static int _serverStartAttempts = 0;
+
+        private static int _updateCallCount;
+        private static float _lastUpdateLogTime;
+
+        /// <summary>
+        /// Called from Plugin.Update() to handle scheduled server start on main thread.
+        /// </summary>
+        public static void Update()
+        {
+            _updateCallCount++;
+
+            // Log periodically to confirm Update is being called
+            if (Time.realtimeSinceStartup - _lastUpdateLogTime > 10f)
+            {
+                _lastUpdateLogTime = Time.realtimeSinceStartup;
+                Plugin.Log.LogInfo($"[AutoLoad] Update() #{_updateCallCount}, pending={_serverStartPending}, scheduled={_serverStartScheduledTime:F1}, now={Time.realtimeSinceStartup:F1}");
+            }
+
+            if (_serverStartPending && Time.realtimeSinceStartup >= _serverStartScheduledTime)
+            {
+                _serverStartPending = false;
+                _serverStartAttempts++;
+                Plugin.DebugLog($"[AutoLoad] Server start attempt #{_serverStartAttempts}...");
+
+                try
+                {
+                    // Check current scene
+                    string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+                    Plugin.DebugLog($"[AutoLoad] Current scene: {currentScene}");
+
+                    // In headless mode, the game may not fully transition to Player Scene
+                    // The server can still work from Main Menu - it just relays save data
+                    // Only wait for Loading scene to complete
+                    bool isLoading = currentScene == "Loading";
+
+                    if (_serverStartAttempts < 3 && isLoading)
+                    {
+                        Plugin.DebugLog($"[AutoLoad] Still in Loading scene, waiting another 5 seconds...");
+                        _serverStartScheduledTime = Time.realtimeSinceStartup + 5f;
+                        _serverStartPending = true;
+                        return;
+                    }
+
+                    Plugin.DebugLog($"[AutoLoad] Starting server on scene '{currentScene}' (attempt #{_serverStartAttempts})");
+
+                    if (DirectConnectManager.StartServer())
+                    {
+                        var addr = DirectConnectManager.GetServerAddress();
+                        Plugin.DebugLog($"[AutoLoad] Server started successfully on {addr}");
+                    }
+                    else
+                    {
+                        Plugin.DebugLog("[AutoLoad] ERROR: Failed to start server!");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.DebugLog($"[AutoLoad] Server start error: {ex.Message}");
+                }
+
+                _isAutoLoading = false;
+            }
+        }
 
         /// <summary>
         /// Gets cached save data as a string. Used by SendSaveString patch when PrepSave fails.
@@ -35,12 +104,13 @@ namespace TechtonicaDedicatedServer.Networking
             }
 
             // Try to read from file if we have the path
+            // The save file is already in the correct format: JSON metadata + newline + base64 messagepack
+            // We should read it as text, NOT base64 encode it again
             if (!string.IsNullOrEmpty(_lastLoadedSavePath) && File.Exists(_lastLoadedSavePath))
             {
                 try
                 {
-                    _cachedSaveBytes = File.ReadAllBytes(_lastLoadedSavePath);
-                    _cachedSaveString = Convert.ToBase64String(_cachedSaveBytes);
+                    _cachedSaveString = File.ReadAllText(_lastLoadedSavePath);
                     Plugin.DebugLog($"[AutoLoad] Cached save data from file: {_cachedSaveString.Length} chars");
                     return _cachedSaveString;
                 }
@@ -64,9 +134,11 @@ namespace TechtonicaDedicatedServer.Networking
 
                 if (File.Exists(savePath))
                 {
-                    _cachedSaveBytes = File.ReadAllBytes(savePath);
-                    _cachedSaveString = Convert.ToBase64String(_cachedSaveBytes);
-                    Plugin.DebugLog($"[AutoLoad] Cached save file: {savePath} ({_cachedSaveBytes.Length} bytes, {_cachedSaveString.Length} chars base64)");
+                    // Read as text - the file is already in the correct format:
+                    // Line 1: JSON metadata
+                    // Line 2+: Base64-encoded LZ4-compressed MessagePack
+                    _cachedSaveString = File.ReadAllText(savePath);
+                    Plugin.DebugLog($"[AutoLoad] Cached save file: {savePath} ({_cachedSaveString.Length} chars)");
                 }
                 else
                 {
@@ -228,34 +300,10 @@ namespace TechtonicaDedicatedServer.Networking
                 }
 
                 // Now we need to start the server after a delay
-                // Since we can't use coroutines, we'll use another thread
-                var serverThread = new Thread(() =>
-                {
-                    Plugin.DebugLog("[AutoLoad-Direct] Server thread waiting 10 seconds for world to load...");
-                    Thread.Sleep(10000); // Wait 10 seconds for world to load
-                    Plugin.DebugLog("[AutoLoad-Direct] Starting server...");
-
-                    try
-                    {
-                        if (DirectConnectManager.StartServer())
-                        {
-                            var addr = DirectConnectManager.GetServerAddress();
-                            Plugin.DebugLog($"[AutoLoad-Direct] Server started successfully on {addr}");
-                        }
-                        else
-                        {
-                            Plugin.DebugLog("[AutoLoad-Direct] ERROR: Failed to start server!");
-                        }
-                    }
-                    catch (Exception serverEx)
-                    {
-                        Plugin.DebugLog($"[AutoLoad-Direct] Server start error: {serverEx.Message}");
-                    }
-
-                    _isAutoLoading = false;
-                });
-                serverThread.IsBackground = true;
-                serverThread.Start();
+                // Use a flag that the main thread Update loop will check
+                Plugin.DebugLog("[AutoLoad-Direct] Scheduling server start in 15 seconds...");
+                _serverStartScheduledTime = Time.realtimeSinceStartup + 15f;
+                _serverStartPending = true;
             }
             catch (Exception ex)
             {

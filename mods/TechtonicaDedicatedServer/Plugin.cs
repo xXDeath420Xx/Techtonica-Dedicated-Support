@@ -39,6 +39,7 @@ namespace TechtonicaDedicatedServer
         public static ConfigEntry<string> AutoLoadSave;
         public static ConfigEntry<int> AutoLoadSlot;
         public static ConfigEntry<string> ConnectAddress;
+        public static ConfigEntry<string> PublicAddress;
 
         private void Awake()
         {
@@ -80,6 +81,12 @@ namespace TechtonicaDedicatedServer
             // Apply auto-start patches (hooks FlowManager.Start to trigger auto-load)
             AutoStartPatches.ApplyPatches(_harmony);
 
+            // Initialize the ServerConnectionHandler (bypasses Harmony for save data sending)
+            if (HeadlessMode.Value)
+            {
+                ServerConnectionHandler.Initialize();
+            }
+
             Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] v{PluginInfo.PLUGIN_VERSION} loaded!");
             Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] Hotkeys: F8=Connect, F9=Host, F10=Status, F11=Stop");
 
@@ -87,6 +94,12 @@ namespace TechtonicaDedicatedServer
             if (AutoStartServer.Value)
             {
                 Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] Auto-start enabled, will start server on port {ServerPort.Value}");
+                DebugLog("[Awake] Auto-start enabled, setting up auto-load...");
+
+                // Register for Unity's onBeforeRender callback - this fires every frame
+                Application.onBeforeRender += OnBeforeRender;
+                DebugLog("[Awake] Registered Application.onBeforeRender callback");
+
                 // Start auto-load in a background thread (bypasses Unity coroutine issues)
                 StartCoroutine(AutoLoadCoroutine());
 
@@ -96,6 +109,48 @@ namespace TechtonicaDedicatedServer
                 autoLoadThread.Start();
             }
         }
+
+        private static int _beforeRenderCount = 0;
+        private static bool _beforeRenderFirstCall = true;
+
+        private static void OnBeforeRender()
+        {
+            _beforeRenderCount++;
+
+            if (_beforeRenderFirstCall)
+            {
+                _beforeRenderFirstCall = false;
+                DebugLog("[OnBeforeRender] FIRST CALL! Application.onBeforeRender is working!");
+            }
+
+            // Log every 300 calls
+            if (_beforeRenderCount % 300 == 0)
+            {
+                DebugLog($"[OnBeforeRender] Called {_beforeRenderCount} times");
+            }
+
+            // Trigger auto-load after 15 seconds
+            if (_threadTriggeredAutoLoad && !Instance._autoLoadStarted)
+            {
+                Instance._autoLoadStarted = true;
+                DebugLog("[OnBeforeRender] Triggering auto-load from onBeforeRender!");
+                AutoLoadManager.TryAutoLoad();
+            }
+
+            // Check for scheduled server start (Update() isn't being called in headless mode)
+            Networking.AutoLoadManager.Update();
+
+            // Check for player connections and send save data (InvokeRepeating doesn't work under Wine)
+            Networking.ServerConnectionHandler.CheckFromCallback();
+        }
+
+        private void Start()
+        {
+            DebugLog("[Start] Plugin Start() method called - MonoBehaviour is active!");
+            Log.LogInfo("[Start] Plugin Start() called - lifecycle methods should work now");
+        }
+
+        private static bool _firstUpdateLogged = false;
 
         private void AutoLoadThreadMethod()
         {
@@ -125,6 +180,14 @@ namespace TechtonicaDedicatedServer
                         AutoLoadManager.TryAutoLoad();
                     }, null);
                     DebugLog("[AutoLoad-Thread] Post() called successfully");
+
+                    // Also set flag as failsafe - if Post() callback never executes,
+                    // LateUpdate/FixedUpdate/OnGUI will trigger auto-load instead
+                    _threadTriggeredAutoLoad = true;
+
+                    // Note: Cannot call Unity APIs directly from background thread - will crash
+                    // Relying on Update/OnGUI hooks to pick up _threadTriggeredAutoLoad flag
+                    DebugLog("[AutoLoad-Thread] Flag set, waiting for main thread to pick it up...");
                 }
                 else
                 {
@@ -152,6 +215,84 @@ namespace TechtonicaDedicatedServer
                 Log?.LogInfo(message);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Find and disable all TVEGlobalVolume components.
+        /// Harmony patches don't work for Unity MonoBehaviour Update methods when called via native code.
+        /// </summary>
+        private static void TryDisableTVEComponents()
+        {
+            try
+            {
+                // Find TVEGlobalVolume type
+                Type tveType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        tveType = asm.GetType("TheVegetationEngine.TVEGlobalVolume");
+                        if (tveType != null) break;
+                    }
+                    catch { }
+                }
+
+                if (tveType == null)
+                {
+                    // Type not loaded yet, try again next frame
+                    return;
+                }
+
+                // Use FindObjectsOfType to get all instances
+                var findMethod = typeof(UnityEngine.Object).GetMethod("FindObjectsOfType",
+                    new Type[] { typeof(Type) });
+                if (findMethod == null)
+                {
+                    Log.LogWarning("[TVE] FindObjectsOfType method not found");
+                    return;
+                }
+
+                var components = findMethod.Invoke(null, new object[] { tveType }) as UnityEngine.Object[];
+                if (components == null || components.Length == 0)
+                {
+                    // No components found yet, try again next frame
+                    return;
+                }
+
+                Log.LogInfo($"[TVE] Found {components.Length} TVEGlobalVolume component(s) - disabling them");
+
+                int disabled = 0;
+                foreach (var component in components)
+                {
+                    if (component == null) continue;
+
+                    try
+                    {
+                        // Cast to MonoBehaviour and disable
+                        var mono = component as MonoBehaviour;
+                        if (mono != null && mono.enabled)
+                        {
+                            mono.enabled = false;
+                            disabled++;
+                            Log.LogInfo($"[TVE] Disabled TVEGlobalVolume on {mono.gameObject?.name ?? "unknown"}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.LogWarning($"[TVE] Error disabling component: {ex.Message}");
+                    }
+                }
+
+                if (disabled > 0)
+                {
+                    Log.LogInfo($"[TVE] Successfully disabled {disabled} TVEGlobalVolume component(s)");
+                    _tveDisabled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"[TVE] Error finding TVEGlobalVolume: {ex.Message}");
+            }
         }
 
         private IEnumerator AutoLoadCoroutine()
@@ -376,6 +517,13 @@ namespace TechtonicaDedicatedServer
                 "51.81.155.59:6968",
                 "Default server address to connect to (ip:port). Used by F8 hotkey."
             );
+
+            PublicAddress = Config.Bind(
+                "Server",
+                "PublicAddress",
+                "certifriedmultitool.com:6968",
+                "Public address shown in logs and Discord webhooks. Set to your domain or public IP."
+            );
         }
 
         private void OnDestroy()
@@ -424,9 +572,27 @@ namespace TechtonicaDedicatedServer
             }
         }
 
+        private static bool _tveDisabled = false;
+
         private void Update()
         {
             _frameCount++;
+
+            // Log first update call to confirm lifecycle is working
+            if (!_firstUpdateLogged)
+            {
+                _firstUpdateLogged = true;
+                DebugLog($"[Update] FIRST Update() call! _threadTriggeredAutoLoad={_threadTriggeredAutoLoad}, _autoLoadStarted={_autoLoadStarted}");
+            }
+
+            // Disable TVEGlobalVolume components in headless mode (Harmony patches don't work for MonoBehaviour Update)
+            if (HeadlessMode.Value && !_tveDisabled)
+            {
+                TryDisableTVEComponents();
+            }
+
+            // Check for scheduled server start (must happen on main thread)
+            Networking.AutoLoadManager.Update();
 
             // Check if thread triggered auto-load
             if (_threadTriggeredAutoLoad && !_autoLoadStarted)

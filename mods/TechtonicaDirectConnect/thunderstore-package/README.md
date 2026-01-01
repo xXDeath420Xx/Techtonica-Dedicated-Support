@@ -43,9 +43,8 @@ After first run, a config file is created at:
 
 ## Finding Servers
 
-Check these resources for community servers:
-- [Techtonica Discord](https://discord.gg/techtonica) - Server listings channel
-- [CertiFried Community](https://certifriedmultitool.com) - Official servers
+- [CertiFried Community](https://certifriedmultitool.com) - Official CertiFried servers
+- [CertiFried Discord](https://discord.com/invite/mJfbDgWA7z) - Server listings and support
 
 ## Server Hosting
 

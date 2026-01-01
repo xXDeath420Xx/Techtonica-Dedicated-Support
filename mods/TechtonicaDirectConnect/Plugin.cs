@@ -10,6 +10,7 @@ using Mirror;
 using kcp2k;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using Mirror.FizzySteam;
 
 namespace TechtonicaDirectConnect
 {
@@ -53,6 +54,10 @@ namespace TechtonicaDirectConnect
         private float _debugTimer = 0f;
         private bool _updateRunning = false;
         private int _lastToggleFrame = -1; // Prevent double-toggle in same frame
+
+        // Pending connection info (for joining from main menu)
+        private string _pendingServerAddress = "";
+        private int _pendingServerPort = 6968;
 
         private void Awake()
         {
@@ -313,68 +318,54 @@ namespace TechtonicaDirectConnect
 
                 if (!inGameWorld)
                 {
-                    Log.LogWarning("[DirectConnect] Not in game world! Trying to trigger JoinMultiplayerAsClient...");
-                    _statusMessage = "Loading game world...";
+                    // Not in game world - trigger FlowManager.JoinGameAsClient to load scenes
+                    Log.LogInfo("[DirectConnect] Not in game world - triggering JoinGameAsClient to load game scenes...");
+                    _statusMessage = "Loading game...";
 
-                    // Try to call the game's JoinMultiplayerAsClient via reflection
-                    var networkConnectorType = AccessTools.TypeByName("NetworkConnector");
-                    if (networkConnectorType != null)
+                    // Store connection info for after scene loads
+                    _pendingServerAddress = _serverAddress;
+                    _pendingServerPort = port;
+
+                    // IMPORTANT: Enable direct connect transport BEFORE loading scenes
+                    // This prevents FizzyFacepunch from trying to use Steam networking
+                    if (!EnableDirectConnect(port))
                     {
-                        var joinMethod = AccessTools.Method(networkConnectorType, "JoinMultiplayerAsClient");
-                        if (joinMethod != null)
-                        {
-                            Log.LogInfo("[DirectConnect] Found JoinMultiplayerAsClient, invoking...");
-                            joinMethod.Invoke(null, null);
-
-                            // Wait for scene to load then connect
-                            _pendingConnect = true;
-                            _pendingPort = port;
-                            StartCoroutine(WaitForSceneAndConnect(port));
-                            return;
-                        }
-                        else
-                        {
-                            Log.LogWarning("[DirectConnect] JoinMultiplayerAsClient method not found");
-                        }
+                        _statusMessage = "Failed to initialize connection";
+                        return;
                     }
 
-                    // If we can't trigger join, warn user
-                    _statusMessage = "Start/load a game first, then connect";
-                    Log.LogWarning("[DirectConnect] Please load a game before connecting to a server");
-                    return;
+                    // CRITICAL: Set the network address BEFORE calling JoinGameAsClient
+                    // The game will try to connect as part of the join flow
+                    var networkManager = NetworkManager.singleton;
+                    if (networkManager != null)
+                    {
+                        networkManager.networkAddress = _serverAddress;
+                        Log.LogInfo($"[DirectConnect] Set network address to: {_serverAddress}");
+                    }
+
+                    // Call FlowManager.JoinGameAsClient() directly - it's a static method
+                    try
+                    {
+                        // Create callback action for when scene finishes loading
+                        Action callback = () => {
+                            Log.LogInfo("[DirectConnect] JoinGameAsClient callback - scene loaded!");
+                        };
+
+                        // Call the static method directly - this will load scene AND connect
+                        FlowManager.JoinGameAsClient(callback);
+                        Log.LogInfo("[DirectConnect] Called FlowManager.JoinGameAsClient successfully");
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.LogError($"[DirectConnect] Failed to call JoinGameAsClient: {ex}");
+                        _statusMessage = "Failed to load game - try loading a save first";
+                        return;
+                    }
                 }
 
-                _isConnecting = true;
-                _statusMessage = "Connecting...";
-
-                // Save last server
-                LastServerAddress.Value = _serverAddress;
-
-                // Enable direct connect transport
-                if (!EnableDirectConnect(port))
-                {
-                    _statusMessage = "Failed to initialize connection";
-                    _isConnecting = false;
-                    return;
-                }
-
-                var networkManager = NetworkManager.singleton;
-                if (networkManager == null)
-                {
-                    _statusMessage = "Error: NetworkManager not found";
-                    _isConnecting = false;
-                    return;
-                }
-
-                // Set address
-                networkManager.networkAddress = _serverAddress;
-
-                // Start client
-                networkManager.StartClient();
-                Log.LogInfo($"[DirectConnect] Connecting to {_serverAddress}:{port}...");
-
-                // Auto-close on success after delay
-                StartCoroutine(CheckConnection());
+                // Already in game world - connect directly
+                DoConnect(_serverAddress, port);
             }
             catch (Exception ex)
             {
@@ -382,69 +373,6 @@ namespace TechtonicaDirectConnect
                 _isConnecting = false;
                 Log.LogError($"[DirectConnect] Connection error: {ex}");
             }
-        }
-
-        private bool _pendingConnect = false;
-        private int _pendingPort = 0;
-
-        private System.Collections.IEnumerator WaitForSceneAndConnect(int port)
-        {
-            float timeout = 30f;
-            float elapsed = 0f;
-
-            while (elapsed < timeout)
-            {
-                // Check if game scenes are loaded
-                bool inGameWorld = false;
-                for (int i = 0; i < SceneManager.sceneCount; i++)
-                {
-                    var sceneName = SceneManager.GetSceneAt(i).name;
-                    if (sceneName.Contains("Player") || sceneName.Contains("Voxeland"))
-                    {
-                        inGameWorld = true;
-                        break;
-                    }
-                }
-
-                if (inGameWorld)
-                {
-                    Log.LogInfo("[DirectConnect] Game world loaded! Proceeding with connection...");
-                    _pendingConnect = false;
-
-                    // Small delay to let things settle
-                    yield return new WaitForSeconds(1f);
-
-                    // Now connect
-                    _isConnecting = true;
-                    _statusMessage = "Connecting...";
-                    LastServerAddress.Value = _serverAddress;
-
-                    if (!EnableDirectConnect(port))
-                    {
-                        _statusMessage = "Failed to initialize connection";
-                        _isConnecting = false;
-                        yield break;
-                    }
-
-                    var networkManager = NetworkManager.singleton;
-                    if (networkManager != null)
-                    {
-                        networkManager.networkAddress = _serverAddress;
-                        networkManager.StartClient();
-                        Log.LogInfo($"[DirectConnect] Connecting to {_serverAddress}:{port}...");
-                        StartCoroutine(CheckConnection());
-                    }
-                    yield break;
-                }
-
-                elapsed += 0.5f;
-                _statusMessage = $"Loading game world... {elapsed:F0}s";
-                yield return new WaitForSeconds(0.5f);
-            }
-
-            _statusMessage = "Failed to load game world";
-            _pendingConnect = false;
-            Log.LogError("[DirectConnect] Timed out waiting for game world to load");
         }
 
         private System.Collections.IEnumerator CheckConnection()
@@ -516,6 +444,168 @@ namespace TechtonicaDirectConnect
             }
         }
 
+        /// <summary>
+        /// Coroutine to connect after JoinGameAsClient callback fires
+        /// </summary>
+        private System.Collections.IEnumerator ConnectAfterSceneLoad()
+        {
+            Log.LogInfo("[DirectConnect] ConnectAfterSceneLoad - waiting for game world...");
+            _statusMessage = "Loading game world...";
+
+            // Wait for game scene to be fully loaded
+            float maxWait = 30f;
+            float elapsed = 0f;
+
+            while (elapsed < maxWait)
+            {
+                // Check if we're in the game world now
+                bool inGameWorld = false;
+                for (int i = 0; i < SceneManager.sceneCount; i++)
+                {
+                    var sceneName = SceneManager.GetSceneAt(i).name;
+                    if (sceneName.Contains("Player") || sceneName.Contains("Voxeland"))
+                    {
+                        inGameWorld = true;
+                        break;
+                    }
+                }
+
+                if (inGameWorld)
+                {
+                    Log.LogInfo("[DirectConnect] Game world loaded! Starting connection...");
+                    yield return new WaitForSeconds(2f); // Give game a moment to fully initialize
+                    DoConnect(_pendingServerAddress, _pendingServerPort);
+                    yield break;
+                }
+
+                elapsed += 0.5f;
+                yield return new WaitForSeconds(0.5f);
+            }
+
+            _statusMessage = "Timeout waiting for game to load";
+            Log.LogError("[DirectConnect] Timeout waiting for game world to load");
+        }
+
+        /// <summary>
+        /// Coroutine to wait for game world and then connect (polling version)
+        /// </summary>
+        private System.Collections.IEnumerator WaitForGameWorldAndConnect(int port)
+        {
+            Log.LogInfo("[DirectConnect] WaitForGameWorldAndConnect - polling for game world...");
+            _statusMessage = "Loading game world...";
+
+            _pendingServerAddress = _serverAddress;
+            _pendingServerPort = port;
+
+            // Wait for game scene to be fully loaded
+            float maxWait = 60f;
+            float elapsed = 0f;
+
+            while (elapsed < maxWait)
+            {
+                // Check if we're in the game world now
+                bool inGameWorld = false;
+                for (int i = 0; i < SceneManager.sceneCount; i++)
+                {
+                    var sceneName = SceneManager.GetSceneAt(i).name;
+                    Log.LogInfo($"[DirectConnect] Checking scene: {sceneName}");
+                    if (sceneName.Contains("Player") || sceneName.Contains("Voxeland"))
+                    {
+                        inGameWorld = true;
+                        break;
+                    }
+                }
+
+                if (inGameWorld)
+                {
+                    Log.LogInfo("[DirectConnect] Game world loaded! Starting connection...");
+                    yield return new WaitForSeconds(3f); // Give game more time to fully initialize
+                    DoConnect(_pendingServerAddress, _pendingServerPort);
+                    yield break;
+                }
+
+                elapsed += 1f;
+                _statusMessage = $"Loading game world... ({elapsed:0}s)";
+                yield return new WaitForSeconds(1f);
+            }
+
+            _statusMessage = "Timeout waiting for game to load";
+            Log.LogError("[DirectConnect] Timeout waiting for game world to load");
+        }
+
+        /// <summary>
+        /// Actually performs the connection (shared by both Connect and post-scene-load)
+        /// </summary>
+        private void DoConnect(string address, int port)
+        {
+            try
+            {
+                _isConnecting = true;
+                _statusMessage = "Connecting...";
+
+                // Save last server
+                LastServerAddress.Value = address;
+
+                // Enable direct connect transport
+                if (!EnableDirectConnect(port))
+                {
+                    _statusMessage = "Failed to initialize connection";
+                    _isConnecting = false;
+                    return;
+                }
+
+                var networkManager = NetworkManager.singleton;
+                if (networkManager == null)
+                {
+                    _statusMessage = "Error: NetworkManager not found";
+                    _isConnecting = false;
+                    return;
+                }
+
+                // Resolve DNS if address is a hostname (not an IP)
+                string resolvedAddress = address;
+                if (!IPAddress.TryParse(address, out _))
+                {
+                    try
+                    {
+                        _statusMessage = $"Resolving {address}...";
+                        Log.LogInfo($"[DirectConnect] Resolving hostname: {address}");
+                        var addresses = Dns.GetHostAddresses(address);
+                        foreach (var addr in addresses)
+                        {
+                            if (addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                            {
+                                resolvedAddress = addr.ToString();
+                                Log.LogInfo($"[DirectConnect] Resolved {address} -> {resolvedAddress}");
+                                break;
+                            }
+                        }
+                    }
+                    catch (Exception dnsEx)
+                    {
+                        Log.LogWarning($"[DirectConnect] DNS resolution failed: {dnsEx.Message}, trying direct connection...");
+                        // Continue with original address - let transport try
+                    }
+                }
+
+                // Set address
+                networkManager.networkAddress = resolvedAddress;
+
+                // Start client
+                networkManager.StartClient();
+                Log.LogInfo($"[DirectConnect] Connecting to {resolvedAddress}:{port}..." + (resolvedAddress != address ? $" (resolved from {address})" : ""));
+
+                // Auto-close on success after delay
+                StartCoroutine(CheckConnection());
+            }
+            catch (Exception ex)
+            {
+                _statusMessage = $"Error: {ex.Message}";
+                _isConnecting = false;
+                Log.LogError($"[DirectConnect] Connection error: {ex}");
+            }
+        }
+
         private void Disconnect()
         {
             try
@@ -529,6 +619,16 @@ namespace TechtonicaDirectConnect
             {
                 Log.LogError($"[DirectConnect] Disconnect error: {ex}");
             }
+        }
+
+        /// <summary>
+        /// Public method to show the connect UI (called from main menu patch)
+        /// </summary>
+        public void ShowConnectUI()
+        {
+            _showConnectUI = true;
+            _statusMessage = "";
+            Log.LogInfo("[DirectConnect] Opening connect UI from main menu");
         }
 
         private static bool EnableDirectConnect(int port)
@@ -628,7 +728,114 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.18";
+        public const string PLUGIN_VERSION = "1.0.26";
+    }
+
+    /// <summary>
+    /// Patches to suppress FizzyFacepunch (Steam transport) errors.
+    /// These occur because Steam isn't properly initialized for direct connect.
+    /// </summary>
+    [HarmonyPatch]
+    public static class FizzyFacepunchPatches
+    {
+        /// <summary>
+        /// Patch FizzyFacepunch.ClientEarlyUpdate to prevent NullReferenceException
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Mirror.FizzySteam.FizzyFacepunch), "ClientEarlyUpdate")]
+        public static bool ClientEarlyUpdate_Prefix()
+        {
+            // Skip if we're using direct connect (KCP transport)
+            return false; // Always skip - we don't use Steam transport
+        }
+
+        /// <summary>
+        /// Patch FizzyFacepunch.ClientLateUpdate to prevent NullReferenceException
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Mirror.FizzySteam.FizzyFacepunch), "ClientLateUpdate")]
+        public static bool ClientLateUpdate_Prefix()
+        {
+            // Skip if we're using direct connect (KCP transport)
+            return false; // Always skip - we don't use Steam transport
+        }
+
+        /// <summary>
+        /// Patch FizzyFacepunch.ServerEarlyUpdate to prevent NullReferenceException
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Mirror.FizzySteam.FizzyFacepunch), "ServerEarlyUpdate")]
+        public static bool ServerEarlyUpdate_Prefix()
+        {
+            return false; // Always skip
+        }
+
+        /// <summary>
+        /// Patch FizzyFacepunch.ServerLateUpdate to prevent NullReferenceException
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Mirror.FizzySteam.FizzyFacepunch), "ServerLateUpdate")]
+        public static bool ServerLateUpdate_Prefix()
+        {
+            return false; // Always skip
+        }
+    }
+
+    /// <summary>
+    /// Patches to enable the hidden "Join Multiplayer" button in the main menu.
+    /// The game has this button but always hides it with flag2 = false.
+    /// </summary>
+    [HarmonyPatch]
+    public static class MainMenuPatches
+    {
+        /// <summary>
+        /// Patch RefreshHiddenButtonState to show the Join Multiplayer button (index 3)
+        /// Original code: flag2 = false; menuSelections[3].gameObject.SetActive(flag2);
+        /// We want to show menuSelections[3] and hook its click to show our connect UI
+        /// </summary>
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(MainMenuUI), "RefreshHiddenButtonState")]
+        public static void RefreshHiddenButtonState_Postfix(MainMenuUI __instance)
+        {
+            try
+            {
+                // Get menuSelections array via reflection
+                var menuSelectionsField = AccessTools.Field(typeof(MainMenuUI), "menuSelections");
+                var menuSelections = menuSelectionsField?.GetValue(__instance) as MainMenuItem[];
+
+                if (menuSelections != null && menuSelections.Length > 3)
+                {
+                    // Show the "Join Multiplayer" button (index 3)
+                    menuSelections[3].gameObject.SetActive(true);
+                    Plugin.Log.LogInfo("[DirectConnect] Enabled 'Join Multiplayer' button in main menu");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] Failed to patch main menu: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Intercept JoinMultiplayerAsClient to show our custom connect dialog instead
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(MainMenuUI), "JoinMultiplayerAsClient")]
+        public static bool JoinMultiplayerAsClient_Prefix()
+        {
+            try
+            {
+                // Show our custom connect UI instead of the default behavior
+                Plugin.Log.LogInfo("[DirectConnect] 'Join Multiplayer' clicked - showing connect dialog");
+                Plugin.Instance.ShowConnectUI();
+                return false; // Skip original method
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] Error in JoinMultiplayerAsClient: {ex}");
+                return true; // Let original method run on error
+            }
+        }
     }
 
     /// <summary>
@@ -646,40 +853,9 @@ namespace TechtonicaDirectConnect
 
             try
             {
-                // Patch NetworkedPlayer methods
-                var networkedPlayerType = AccessTools.TypeByName("NetworkedPlayer");
-                if (networkedPlayerType != null)
-                {
-                    var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(Skip_Prefix));
-
-                    // Patch Update
-                    var updateMethod = AccessTools.Method(networkedPlayerType, "Update");
-                    if (updateMethod != null)
-                    {
-                        harmony.Patch(updateMethod, prefix: prefix);
-                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkedPlayer.Update to skip");
-                    }
-
-                    // Patch OnStartClient - crashes when player spawns without proper initialization
-                    var onStartClientMethod = AccessTools.Method(networkedPlayerType, "OnStartClient");
-                    if (onStartClientMethod != null)
-                    {
-                        harmony.Patch(onStartClientMethod, prefix: prefix);
-                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkedPlayer.OnStartClient to skip");
-                    }
-
-                    // Patch OnStartLocalPlayer - crashes when local player created without proper scene
-                    var onStartLocalPlayerMethod = AccessTools.Method(networkedPlayerType, "OnStartLocalPlayer");
-                    if (onStartLocalPlayerMethod != null)
-                    {
-                        harmony.Patch(onStartLocalPlayerMethod, prefix: prefix);
-                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkedPlayer.OnStartLocalPlayer to skip");
-                    }
-                }
-                else
-                {
-                    Plugin.Log.LogWarning("[DirectConnect] NetworkedPlayer type not found");
-                }
+                // NOTE: We do NOT patch NetworkedPlayer.OnStartClient or OnStartLocalPlayer
+                // Those methods are REQUIRED for the client to request save data from the server
+                // The server mod patches them for headless mode, but client needs them to work
 
                 // Patch ThirdPersonDisplayAnimator.Update and UpdateSillyStuff
                 var animatorType = AccessTools.TypeByName("ThirdPersonDisplayAnimator");
@@ -706,6 +882,29 @@ namespace TechtonicaDirectConnect
                     Plugin.Log.LogWarning("[DirectConnect] ThirdPersonDisplayAnimator type not found");
                 }
 
+                // Patch NetworkMessageRelay.SendNetworkAction - crashes when network isn't connected
+                var networkRelayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (networkRelayType != null)
+                {
+                    var sendMethod = AccessTools.Method(networkRelayType, "SendNetworkAction");
+                    if (sendMethod != null)
+                    {
+                        var finalizer = new HarmonyMethod(typeof(NullSafetyPatches), nameof(SuppressException_Finalizer));
+                        harmony.Patch(sendMethod, finalizer: finalizer);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.SendNetworkAction with finalizer");
+                    }
+
+                    // Patch RequestCurrentSimTick - server might not have NetworkMessageRelay on dedicated servers
+                    var requestMethod = AccessTools.Method(networkRelayType, "RequestCurrentSimTick");
+                    if (requestMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(RequestCurrentSimTick_Prefix));
+                        var finalizer = new HarmonyMethod(typeof(NullSafetyPatches), nameof(RequestCurrentSimTick_Finalizer));
+                        harmony.Patch(requestMethod, prefix: prefix, finalizer: finalizer);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.RequestCurrentSimTick with prefix and finalizer");
+                    }
+                }
+
                 _patchesApplied = true;
             }
             catch (Exception ex)
@@ -720,6 +919,99 @@ namespace TechtonicaDirectConnect
         public static bool Skip_Prefix()
         {
             return false;
+        }
+
+        /// <summary>
+        /// Finalizer that suppresses exceptions (for methods that should not crash the game)
+        /// </summary>
+        public static Exception SuppressException_Finalizer(Exception __exception)
+        {
+            // Suppress null reference exceptions - they happen when network isn't ready
+            if (__exception is NullReferenceException)
+            {
+                return null; // Suppress the exception
+            }
+            return __exception; // Let other exceptions through
+        }
+
+        private static bool _requestSimTickHandled = false;
+
+        /// <summary>
+        /// Prefix for RequestCurrentSimTick - handles the case where the server doesn't have
+        /// NetworkMessageRelay (dedicated servers run on Main Menu scene without Player Scene)
+        /// </summary>
+        public static bool RequestCurrentSimTick_Prefix(object __instance)
+        {
+            if (__instance == null)
+            {
+                Plugin.Log.LogWarning("[DirectConnect] RequestCurrentSimTick called on null instance - dedicated server mode?");
+                // Call OnFinishLoading directly since server can't respond
+                TryCallOnFinishLoading();
+                return false; // Skip original method
+            }
+            return true; // Run original method
+        }
+
+        /// <summary>
+        /// Finalizer for RequestCurrentSimTick - if it throws, complete loading anyway
+        /// </summary>
+        public static Exception RequestCurrentSimTick_Finalizer(Exception __exception)
+        {
+            if (__exception != null)
+            {
+                Plugin.Log.LogWarning($"[DirectConnect] RequestCurrentSimTick exception: {__exception.Message}");
+                // Server probably doesn't have NetworkMessageRelay - complete loading directly
+                TryCallOnFinishLoading();
+                return null; // Suppress the exception
+            }
+            return __exception;
+        }
+
+        /// <summary>
+        /// Calls LoadingUI.OnFinishLoading() to complete the loading screen
+        /// </summary>
+        private static void TryCallOnFinishLoading()
+        {
+            if (_requestSimTickHandled) return;
+            _requestSimTickHandled = true;
+
+            try
+            {
+                Plugin.Log.LogInfo("[DirectConnect] Calling LoadingUI.OnFinishLoading() directly (dedicated server mode)");
+
+                var loadingUIType = AccessTools.TypeByName("LoadingUI");
+                if (loadingUIType != null)
+                {
+                    var instanceProp = AccessTools.Property(loadingUIType, "instance");
+                    var loadingUI = instanceProp?.GetValue(null);
+
+                    if (loadingUI != null)
+                    {
+                        var onFinishMethod = AccessTools.Method(loadingUIType, "OnFinishLoading");
+                        if (onFinishMethod != null)
+                        {
+                            onFinishMethod.Invoke(loadingUI, null);
+                            Plugin.Log.LogInfo("[DirectConnect] Successfully called LoadingUI.OnFinishLoading()");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogError("[DirectConnect] LoadingUI.OnFinishLoading method not found");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[DirectConnect] LoadingUI.instance is null - may need to wait");
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogError("[DirectConnect] LoadingUI type not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] Error calling OnFinishLoading: {ex}");
+            }
         }
     }
 }
