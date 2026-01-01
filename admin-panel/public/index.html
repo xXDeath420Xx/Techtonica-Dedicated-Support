@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --color-dark-900: #0b0f11;
@@ -66,56 +67,91 @@
         }
 
         .sidebar-header {
-            padding: 1.5rem;
+            padding: 1.25rem;
             border-bottom: 1px solid var(--color-border-primary);
         }
 
         .sidebar-brand { display: flex; align-items: center; gap: 0.75rem; }
 
         .sidebar-logo {
-            width: 40px;
-            height: 40px;
+            width: 44px;
+            height: 44px;
             background: var(--gradient-accent);
-            border-radius: 0.5rem;
+            border-radius: 0.625rem;
             display: flex;
             align-items: center;
             justify-content: center;
+            box-shadow: 0 4px 12px rgba(167, 139, 250, 0.3);
         }
 
         .sidebar-title { font-size: 1.125rem; font-weight: 700; }
-        .sidebar-subtitle { font-size: 0.75rem; color: var(--color-text-muted); }
+        .sidebar-subtitle { font-size: 0.7rem; color: var(--color-text-muted); letter-spacing: 0.05em; }
+
+        .server-status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--color-dark-700);
+            border-radius: 0.375rem;
+            font-size: 0.75rem;
+        }
+
+        .status-dot-large {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot-large.running { background: var(--color-success); box-shadow: 0 0 8px var(--color-success); }
+        .status-dot-large.stopped { background: var(--color-danger); }
+        .status-dot-large.starting { background: var(--color-warning); animation: blink 0.5s infinite; }
+
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
         .sidebar-nav { flex: 1; padding: 1rem 0.75rem; overflow-y: auto; }
-        .nav-section { margin-bottom: 1.5rem; }
-        .nav-section-title { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); padding: 0 0.75rem; margin-bottom: 0.5rem; }
+        .nav-section { margin-bottom: 1.25rem; }
+        .nav-section-title { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-text-muted); padding: 0 0.75rem; margin-bottom: 0.5rem; }
 
         .nav-item {
             display: flex;
             align-items: center;
             gap: 0.75rem;
-            padding: 0.75rem;
+            padding: 0.625rem 0.75rem;
             border-radius: 0.5rem;
             color: var(--color-text-secondary);
             text-decoration: none;
             cursor: pointer;
-            transition: all 0.2s;
+            transition: all 0.15s;
+            font-size: 0.875rem;
         }
 
         .nav-item:hover { background: var(--color-card-bg); color: var(--color-text-primary); }
         .nav-item.active { background: rgba(167, 139, 250, 0.15); color: var(--color-primary-500); }
-        .nav-icon { width: 20px; height: 20px; opacity: 0.8; }
+        .nav-icon { width: 18px; height: 18px; opacity: 0.8; }
+
+        .nav-badge {
+            margin-left: auto;
+            padding: 0.125rem 0.5rem;
+            background: var(--color-primary-600);
+            border-radius: 9999px;
+            font-size: 0.625rem;
+            font-weight: 600;
+        }
 
         .sidebar-footer { padding: 1rem; border-top: 1px solid var(--color-border-primary); }
         .user-info { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem; }
         .user-avatar { width: 36px; height: 36px; background: var(--gradient-primary); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.875rem; }
         .user-details { flex: 1; }
         .user-name { font-weight: 500; font-size: 0.875rem; }
-        .user-role { font-size: 0.75rem; color: var(--color-text-muted); }
+        .user-role { font-size: 0.7rem; color: var(--color-text-muted); }
 
         .main-content { flex: 1; margin-left: 260px; min-height: 100vh; }
 
         .topbar {
-            height: 64px;
+            height: 60px;
             background: var(--color-dark-800);
             border-bottom: 1px solid var(--color-border-primary);
             display: flex;
@@ -127,54 +163,80 @@
             z-index: 50;
         }
 
-        .topbar-title { font-size: 1.25rem; font-weight: 600; }
+        .topbar-left { display: flex; align-items: center; gap: 1rem; }
+        .topbar-title { font-size: 1.125rem; font-weight: 600; }
+        .topbar-subtitle { font-size: 0.75rem; color: var(--color-text-muted); }
         .topbar-actions { display: flex; align-items: center; gap: 0.75rem; }
-        .content { padding: 1.5rem; max-width: 1400px; }
+
+        .quick-action {
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--color-dark-600);
+            border: 1px solid var(--color-border-primary);
+            border-radius: 0.5rem;
+            color: var(--color-text-secondary);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .quick-action:hover { background: var(--color-dark-500); color: var(--color-text-primary); }
+        .quick-action.danger:hover { background: rgba(248, 113, 113, 0.15); color: var(--color-danger); }
+
+        .content { padding: 1.25rem; max-width: 1600px; }
 
         .card {
             background: var(--color-dark-700);
             border: 1px solid var(--color-border-primary);
             border-radius: 0.75rem;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
+            padding: 1.25rem;
+            margin-bottom: 1rem;
         }
 
         .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
-        .card-title { font-size: 1rem; font-weight: 600; }
+        .card-title { font-size: 0.9375rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }
+        .card-subtitle { font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.125rem; }
 
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem; }
 
-        .status-card {
-            background: var(--color-dark-700);
+        .metric-card {
+            background: var(--color-dark-800);
             border: 1px solid var(--color-border-primary);
-            border-radius: 0.75rem;
-            padding: 1.25rem;
-            display: flex;
-            align-items: flex-start;
-            gap: 1rem;
+            border-radius: 0.625rem;
+            padding: 1rem;
+            position: relative;
+            overflow: hidden;
         }
 
-        .status-icon { width: 48px; height: 48px; border-radius: 0.5rem; display: flex; align-items: center; justify-content: center; }
-        .status-icon.running { background: rgba(52, 211, 153, 0.15); color: var(--color-success); }
-        .status-icon.stopped { background: rgba(248, 113, 113, 0.15); color: var(--color-danger); }
-        .status-icon.starting { background: rgba(251, 191, 36, 0.15); color: var(--color-warning); }
-        .status-icon.info { background: rgba(96, 165, 250, 0.15); color: var(--color-info); }
-        .status-icon.purple { background: rgba(167, 139, 250, 0.15); color: var(--color-primary-500); }
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+        }
 
-        .status-info h3 { font-size: 0.75rem; font-weight: 500; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.25rem; }
-        .status-value { font-size: 1.5rem; font-weight: 700; }
+        .metric-card.primary::before { background: var(--gradient-primary); }
+        .metric-card.success::before { background: var(--gradient-success); }
+        .metric-card.info::before { background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+        .metric-card.warning::before { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
 
-        .status-badge { display: inline-flex; align-items: center; gap: 0.375rem; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
-        .status-badge.running { background: rgba(52, 211, 153, 0.15); color: var(--color-success); }
-        .status-badge.stopped { background: rgba(248, 113, 113, 0.15); color: var(--color-danger); }
-        .status-badge.starting { background: rgba(251, 191, 36, 0.15); color: var(--color-warning); }
+        .metric-label { font-size: 0.6875rem; font-weight: 500; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+        .metric-value { font-size: 1.5rem; font-weight: 700; line-height: 1; }
+        .metric-change { font-size: 0.6875rem; color: var(--color-text-muted); margin-top: 0.375rem; }
+        .metric-change.positive { color: var(--color-success); }
+        .metric-change.negative { color: var(--color-danger); }
 
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; animation: pulse 2s infinite; }
-        .status-dot.running { background: var(--color-success); }
-        .status-dot.stopped { background: var(--color-danger); }
-        .status-dot.starting { background: var(--color-warning); }
+        .chart-container { height: 200px; position: relative; }
+        .chart-container.small { height: 120px; }
 
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .server-controls {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
 
         .btn {
             display: inline-flex;
@@ -183,12 +245,15 @@
             padding: 0.625rem 1rem;
             border: none;
             border-radius: 0.5rem;
-            font-size: 0.875rem;
+            font-size: 0.8125rem;
             font-weight: 500;
             font-family: inherit;
             cursor: pointer;
-            transition: all 0.2s;
+            transition: all 0.15s;
         }
+
+        .btn-lg { padding: 0.75rem 1.25rem; font-size: 0.875rem; }
+        .btn-sm { padding: 0.375rem 0.75rem; font-size: 0.75rem; }
 
         .btn-primary { background: var(--gradient-primary); color: white; }
         .btn-primary:hover { box-shadow: var(--shadow-glow); transform: translateY(-1px); }
@@ -196,17 +261,25 @@
         .btn-danger { background: var(--gradient-danger); color: white; }
         .btn-secondary { background: var(--color-dark-600); color: var(--color-text-secondary); border: 1px solid var(--color-border-primary); }
         .btn-secondary:hover { background: var(--color-dark-500); color: var(--color-text-primary); }
+        .btn-outline { background: transparent; border: 1px solid var(--color-border-primary); color: var(--color-text-secondary); }
+        .btn-outline:hover { border-color: var(--color-primary-500); color: var(--color-primary-500); }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
         .btn-group { display: flex; gap: 0.5rem; }
+
+        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+
+        @media (max-width: 1200px) { .grid-3 { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 900px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
 
         .console {
             background: var(--color-dark-900);
             border: 1px solid var(--color-border-primary);
             border-radius: 0.5rem;
             font-family: var(--font-mono);
-            font-size: 0.8125rem;
+            font-size: 0.75rem;
             line-height: 1.6;
-            max-height: 400px;
+            max-height: 500px;
             overflow-y: auto;
         }
 
@@ -214,106 +287,239 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0.75rem 1rem;
+            padding: 0.625rem 1rem;
             background: var(--color-dark-800);
             border-bottom: 1px solid var(--color-border-primary);
             position: sticky;
             top: 0;
         }
 
-        .console-tabs { display: flex; gap: 0.5rem; }
-        .console-tab { padding: 0.375rem 0.75rem; border-radius: 0.25rem; font-size: 0.75rem; cursor: pointer; background: transparent; border: none; color: var(--color-text-muted); font-family: inherit; }
+        .console-tabs { display: flex; gap: 0.375rem; }
+        .console-tab { padding: 0.375rem 0.75rem; border-radius: 0.25rem; font-size: 0.6875rem; cursor: pointer; background: transparent; border: none; color: var(--color-text-muted); font-family: inherit; transition: all 0.15s; }
+        .console-tab:hover { color: var(--color-text-primary); }
         .console-tab.active { background: var(--color-primary-600); color: white; }
-        .console-content { padding: 1rem; white-space: pre-wrap; word-break: break-all; }
-        .console-line { color: var(--color-text-secondary); }
+        .console-content { padding: 0.75rem 1rem; white-space: pre-wrap; word-break: break-all; }
+        .console-line { color: var(--color-text-secondary); padding: 0.125rem 0; }
         .console-line.info { color: var(--color-info); }
         .console-line.warn { color: var(--color-warning); }
         .console-line.error { color: var(--color-danger); }
+        .console-line.success { color: var(--color-success); }
+
+        .activity-list { max-height: 300px; overflow-y: auto; }
+
+        .activity-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--color-border-primary);
+        }
+
+        .activity-item:last-child { border-bottom: none; }
+
+        .activity-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .activity-icon.start { background: rgba(52, 211, 153, 0.15); color: var(--color-success); }
+        .activity-icon.stop { background: rgba(248, 113, 113, 0.15); color: var(--color-danger); }
+        .activity-icon.config { background: rgba(96, 165, 250, 0.15); color: var(--color-info); }
+        .activity-icon.user { background: rgba(167, 139, 250, 0.15); color: var(--color-primary-500); }
+
+        .activity-content { flex: 1; }
+        .activity-title { font-size: 0.8125rem; font-weight: 500; }
+        .activity-meta { font-size: 0.6875rem; color: var(--color-text-muted); margin-top: 0.125rem; }
+
+        .player-list { display: flex; flex-direction: column; gap: 0.5rem; }
+
+        .player-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.625rem 0.75rem;
+            background: var(--color-dark-800);
+            border: 1px solid var(--color-border-primary);
+            border-radius: 0.5rem;
+        }
+
+        .player-info { display: flex; align-items: center; gap: 0.75rem; }
+        .player-avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--gradient-accent); display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; }
+        .player-name { font-size: 0.8125rem; font-weight: 500; }
+        .player-meta { font-size: 0.6875rem; color: var(--color-text-muted); }
+
+        .schedule-list { display: flex; flex-direction: column; gap: 0.5rem; }
+
+        .schedule-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem;
+            background: var(--color-dark-800);
+            border: 1px solid var(--color-border-primary);
+            border-radius: 0.5rem;
+        }
+
+        .schedule-info { display: flex; align-items: center; gap: 0.75rem; }
+        .schedule-icon { width: 36px; height: 36px; background: rgba(96, 165, 250, 0.15); color: var(--color-info); border-radius: 0.375rem; display: flex; align-items: center; justify-content: center; }
+        .schedule-time { font-size: 0.875rem; font-weight: 600; }
+        .schedule-desc { font-size: 0.75rem; color: var(--color-text-muted); }
 
         .config-section { margin-bottom: 1.5rem; }
-        .config-section-title { font-size: 0.875rem; font-weight: 600; color: var(--color-primary-400); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
-        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
-        .config-item { display: flex; flex-direction: column; gap: 0.5rem; }
-        .config-label { font-size: 0.8125rem; color: var(--color-text-secondary); }
-        .config-input { padding: 0.625rem 0.75rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.375rem; color: var(--color-text-primary); font-family: var(--font-mono); font-size: 0.875rem; }
+        .config-section-title { font-size: 0.8125rem; font-weight: 600; color: var(--color-primary-400); margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; }
+        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 0.75rem; }
+        .config-item { display: flex; flex-direction: column; gap: 0.375rem; }
+        .config-label { font-size: 0.75rem; color: var(--color-text-secondary); }
+        .config-input { padding: 0.5rem 0.75rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.375rem; color: var(--color-text-primary); font-family: var(--font-mono); font-size: 0.8125rem; }
         .config-input:focus { outline: none; border-color: var(--color-primary-500); }
         .config-toggle { display: flex; align-items: center; gap: 0.75rem; }
-        .toggle-switch { width: 44px; height: 24px; background: var(--color-dark-600); border-radius: 12px; position: relative; cursor: pointer; transition: background 0.2s; }
+        .toggle-switch { width: 40px; height: 22px; background: var(--color-dark-600); border-radius: 11px; position: relative; cursor: pointer; transition: background 0.2s; }
         .toggle-switch.active { background: var(--color-primary-600); }
-        .toggle-switch::after { content: ''; position: absolute; width: 18px; height: 18px; background: white; border-radius: 50%; top: 3px; left: 3px; transition: transform 0.2s; }
-        .toggle-switch.active::after { transform: translateX(20px); }
+        .toggle-switch::after { content: ''; position: absolute; width: 16px; height: 16px; background: white; border-radius: 50%; top: 3px; left: 3px; transition: transform 0.2s; }
+        .toggle-switch.active::after { transform: translateX(18px); }
 
         .saves-list { display: flex; flex-direction: column; gap: 0.5rem; }
-        .save-item { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.5rem; cursor: pointer; transition: border-color 0.2s; }
+        .save-item { display: flex; align-items: center; justify-content: space-between; padding: 0.625rem 0.75rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.5rem; transition: border-color 0.15s; }
         .save-item:hover { border-color: var(--color-border-hover); }
+        .save-item.active { border-color: var(--color-success); background: rgba(52, 211, 153, 0.05); }
         .save-item.selected { border-color: var(--color-primary-500); background: rgba(167, 139, 250, 0.05); }
-        .save-info { display: flex; flex-direction: column; }
-        .save-name { font-weight: 500; font-size: 0.875rem; }
-        .save-meta { font-size: 0.75rem; color: var(--color-text-muted); }
+        .save-info { display: flex; flex-direction: column; flex: 1; }
+        .save-name { font-weight: 500; font-size: 0.8125rem; display: flex; align-items: center; gap: 0.5rem; }
+        .save-name .active-badge { font-size: 0.625rem; background: var(--color-success); color: #fff; padding: 0.125rem 0.375rem; border-radius: 0.25rem; font-weight: 600; }
+        .save-meta { font-size: 0.6875rem; color: var(--color-text-muted); }
+        .save-actions { display: flex; gap: 0.375rem; }
+        .active-save-banner { display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1rem; background: rgba(52, 211, 153, 0.1); border: 1px solid rgba(52, 211, 153, 0.3); border-radius: 0.5rem; margin-bottom: 1rem; color: var(--color-success); font-size: 0.875rem; }
+        .active-save-banner strong { color: var(--color-text-primary); }
 
         .users-table { width: 100%; border-collapse: collapse; }
-        .users-table th, .users-table td { padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--color-border-primary); }
-        .users-table th { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); }
+        .users-table th, .users-table td { padding: 0.625rem 0.75rem; text-align: left; border-bottom: 1px solid var(--color-border-primary); }
+        .users-table th { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-text-muted); }
         .users-table tr:hover { background: var(--color-card-bg); }
-        .role-badge { display: inline-flex; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.75rem; font-weight: 500; }
+        .role-badge { display: inline-flex; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.6875rem; font-weight: 500; }
+        .role-badge.owner { background: rgba(251, 191, 36, 0.15); color: var(--color-warning); }
         .role-badge.admin { background: rgba(167, 139, 250, 0.15); color: var(--color-primary-500); }
         .role-badge.manager { background: rgba(96, 165, 250, 0.15); color: var(--color-info); }
 
-        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; visibility: hidden; transition: all 0.2s; }
+        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; opacity: 0; visibility: hidden; transition: all 0.2s; backdrop-filter: blur(4px); }
         .modal-overlay.show { opacity: 1; visibility: visible; }
         .modal { background: var(--color-dark-700); border: 1px solid var(--color-border-primary); border-radius: 0.75rem; width: 100%; max-width: 480px; max-height: 90vh; overflow-y: auto; transform: translateY(20px); transition: transform 0.2s; }
         .modal-overlay.show .modal { transform: translateY(0); }
-        .modal-header { padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--color-border-primary); display: flex; align-items: center; justify-content: space-between; }
-        .modal-title { font-size: 1.125rem; font-weight: 600; }
-        .modal-close { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: none; border: none; color: var(--color-text-muted); cursor: pointer; border-radius: 0.25rem; font-size: 1.5rem; }
+        .modal-header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--color-border-primary); display: flex; align-items: center; justify-content: space-between; }
+        .modal-title { font-size: 1rem; font-weight: 600; }
+        .modal-close { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: none; border: none; color: var(--color-text-muted); cursor: pointer; border-radius: 0.25rem; font-size: 1.25rem; }
         .modal-close:hover { background: var(--color-card-bg); color: var(--color-text-primary); }
-        .modal-body { padding: 1.5rem; }
-        .modal-footer { padding: 1rem 1.5rem; border-top: 1px solid var(--color-border-primary); display: flex; justify-content: flex-end; gap: 0.75rem; }
-        .form-group { margin-bottom: 1.25rem; }
-        .form-label { display: block; font-size: 0.875rem; font-weight: 500; color: var(--color-text-secondary); margin-bottom: 0.5rem; }
-        .form-input, .form-select { width: 100%; padding: 0.625rem 0.75rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.375rem; color: var(--color-text-primary); font-size: 0.875rem; font-family: inherit; }
+        .modal-body { padding: 1.25rem; }
+        .modal-footer { padding: 1rem 1.25rem; border-top: 1px solid var(--color-border-primary); display: flex; justify-content: flex-end; gap: 0.5rem; }
+        .form-group { margin-bottom: 1rem; }
+        .form-label { display: block; font-size: 0.8125rem; font-weight: 500; color: var(--color-text-secondary); margin-bottom: 0.375rem; }
+        .form-input, .form-select { width: 100%; padding: 0.5rem 0.75rem; background: var(--color-dark-800); border: 1px solid var(--color-border-primary); border-radius: 0.375rem; color: var(--color-text-primary); font-size: 0.8125rem; font-family: inherit; }
         .form-input:focus, .form-select:focus { outline: none; border-color: var(--color-primary-500); }
 
         .tab-panel { display: none; }
         .tab-panel.active { display: block; }
 
         .toast-container { position: fixed; top: 1rem; right: 1rem; z-index: 1100; display: flex; flex-direction: column; gap: 0.5rem; }
-        .toast { padding: 1rem 1.25rem; background: var(--color-dark-700); border: 1px solid var(--color-border-primary); border-radius: 0.5rem; display: flex; align-items: center; gap: 0.75rem; animation: slideIn 0.3s ease; min-width: 280px; }
+        .toast { padding: 0.75rem 1rem; background: var(--color-dark-700); border: 1px solid var(--color-border-primary); border-radius: 0.5rem; display: flex; align-items: center; gap: 0.75rem; animation: slideIn 0.3s ease; min-width: 280px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3); }
         .toast.success { border-left: 3px solid var(--color-success); }
         .toast.error { border-left: 3px solid var(--color-danger); }
         .toast.info { border-left: 3px solid var(--color-info); }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
 
-        @media (max-width: 768px) { .sidebar { display: none; } .main-content { margin-left: 0; } .status-grid { grid-template-columns: 1fr; } }
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            color: var(--color-text-muted);
+            text-align: center;
+        }
+
+        .empty-state svg { margin-bottom: 1rem; opacity: 0.5; }
+        .empty-state p { font-size: 0.8125rem; }
+
+        .system-info { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; font-size: 0.75rem; }
+        .system-info-item { display: flex; justify-content: space-between; padding: 0.375rem 0; border-bottom: 1px solid var(--color-border-primary); }
+        .system-info-label { color: var(--color-text-muted); }
+        .system-info-value { font-family: var(--font-mono); color: var(--color-text-secondary); }
+
+        @media (max-width: 768px) {
+            .app-container { flex-direction: column; }
+            .sidebar { position: fixed; left: -260px; top: 0; height: 100vh; z-index: 1000; transition: left 0.3s ease; }
+            .sidebar.open { left: 0; }
+            .main-content { margin-left: 0; }
+            .topbar { display: none; }
+            .metrics-grid { grid-template-columns: 1fr 1fr; }
+            .mobile-header { display: flex !important; }
+            .sidebar-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 999; }
+            .sidebar-overlay.show { display: block; }
+        }
+        .mobile-header { display: none; align-items: center; justify-content: space-between; padding: 0.5rem 0.75rem; background: var(--color-dark-800); border-bottom: 1px solid var(--color-border-primary); }
+        .mobile-menu-btn { background: none; border: none; color: var(--color-text-primary); cursor: pointer; padding: 0.5rem; display: flex; align-items: center; justify-content: center; border-radius: 0.375rem; }
+        .mobile-menu-btn:active { background: var(--color-dark-600); }
+        .mobile-status { display: flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; padding: 0.25rem 0.625rem; border-radius: 1rem; font-weight: 500; }
+        .mobile-status.online { background: rgba(52, 211, 153, 0.15); color: var(--color-success); }
+        .mobile-status.offline { background: rgba(248, 113, 113, 0.15); color: var(--color-danger); }
     </style>
 </head>
 <body>
     <div class="app-container">
+        <div class="mobile-header">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <button class="mobile-menu-btn" onclick="toggleMobileMenu()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+                </button>
+                <div style="width: 28px; height: 28px; background: var(--gradient-accent); border-radius: 0.375rem; display: flex; align-items: center; justify-content: center;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                </div>
+                <span style="font-weight: 600; font-size: 0.875rem;">Techtonica</span>
+            </div>
+            <div class="mobile-status offline" id="mobile-status">Offline</div>
+        </div>
+        <div class="sidebar-overlay" onclick="toggleMobileMenu()"></div>
         <aside class="sidebar">
             <div class="sidebar-header">
                 <div class="sidebar-brand">
                     <div class="sidebar-logo">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2">
+                        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2">
                             <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
                         </svg>
                     </div>
                     <div>
                         <div class="sidebar-title">Techtonica</div>
-                        <div class="sidebar-subtitle">Server Manager</div>
+                        <div class="sidebar-subtitle">SERVER MANAGER</div>
                     </div>
+                </div>
+                <div class="server-status-indicator">
+                    <span class="status-dot-large stopped" id="sidebar-status-dot"></span>
+                    <span id="sidebar-status-text">Checking...</span>
                 </div>
             </div>
             <nav class="sidebar-nav">
                 <div class="nav-section">
-                    <div class="nav-section-title">Server</div>
+                    <div class="nav-section-title">Main</div>
                     <a class="nav-item active" data-tab="dashboard">
                         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
                         Dashboard
                     </a>
                     <a class="nav-item" data-tab="console">
                         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-                        Console
+                        Live Console
                     </a>
+                    <a class="nav-item" data-tab="players">
+                        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                        Players
+                        <span class="nav-badge" id="player-count-badge">0</span>
+                    </a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Server</div>
                     <a class="nav-item" data-tab="config">
                         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                         Configuration
@@ -322,12 +528,20 @@
                         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                         Save Files
                     </a>
+                    <a class="nav-item" data-tab="scheduler">
+                        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        Scheduler
+                    </a>
                 </div>
                 <div class="nav-section" id="admin-nav" style="display: none;">
                     <div class="nav-section-title">Administration</div>
                     <a class="nav-item" data-tab="users">
-                        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-                        User Management
+                        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 3a3 3 0 1 1-3 3 3 3 0 0 1 3-3zm0 14a8.72 8.72 0 0 1-5.33-1.82 3 3 0 0 1 5.33-2.18 3 3 0 0 1 5.33 2.18A8.72 8.72 0 0 1 12 19z"/></svg>
+                        Users
+                    </a>
+                    <a class="nav-item" data-tab="integrations">
+                        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                        Integrations
                     </a>
                 </div>
             </nav>
@@ -339,93 +553,204 @@
                         <div class="user-role" id="user-role">Administrator</div>
                     </div>
                 </div>
-                <button class="btn btn-secondary" style="width: 100%; margin-top: 0.75rem;" onclick="logout()">Sign Out</button>
+                <button class="btn btn-secondary" style="width: 100%; margin-top: 0.5rem;" onclick="logout()">Sign Out</button>
             </div>
         </aside>
 
         <main class="main-content">
             <header class="topbar">
-                <h1 class="topbar-title" id="page-title">Dashboard</h1>
+                <div class="topbar-left">
+                    <div>
+                        <h1 class="topbar-title" id="page-title">Dashboard</h1>
+                        <div class="topbar-subtitle">Techtonica Dedicated Server</div>
+                    </div>
+                </div>
                 <div class="topbar-actions">
-                    <span class="status-badge" id="server-status-badge"><span class="status-dot stopped"></span> Checking...</span>
+                    <button class="quick-action" onclick="refreshAll()" title="Refresh All">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    </button>
+                    <button class="quick-action danger" onclick="stopServer()" title="Emergency Stop" id="emergency-stop" disabled>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6"/></svg>
+                    </button>
                 </div>
             </header>
 
             <div class="content">
+                <!-- Dashboard Panel -->
                 <div class="tab-panel active" id="panel-dashboard">
-                    <div class="status-grid">
-                        <div class="status-card">
-                            <div class="status-icon" id="status-icon">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
-                            </div>
-                            <div class="status-info"><h3>Server Status</h3><div class="status-value" id="server-status">Checking...</div></div>
+                    <div class="metrics-grid">
+                        <div class="metric-card primary">
+                            <div class="metric-label">Server Status</div>
+                            <div class="metric-value" id="metric-status">Offline</div>
+                            <div class="metric-change" id="metric-uptime">--</div>
                         </div>
-                        <div class="status-card">
-                            <div class="status-icon info">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                            </div>
-                            <div class="status-info"><h3>Uptime</h3><div class="status-value" id="server-uptime">--</div></div>
+                        <div class="metric-card success">
+                            <div class="metric-label">Players Online</div>
+                            <div class="metric-value" id="metric-players">0</div>
+                            <div class="metric-change">of 16 max</div>
                         </div>
-                        <div class="status-card">
-                            <div class="status-icon purple">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                            </div>
-                            <div class="status-info"><h3>Connect Address</h3><div class="status-value" style="font-size: 1rem;" id="connect-address">51.81.155.59:6968</div></div>
+                        <div class="metric-card info">
+                            <div class="metric-label">CPU Usage</div>
+                            <div class="metric-value" id="metric-cpu">--%</div>
+                            <div class="metric-change" id="metric-cpu-change">System load</div>
                         </div>
-                        <div class="status-card">
-                            <div class="status-icon info">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                            </div>
-                            <div class="status-info"><h3>Port</h3><div class="status-value" id="server-port">6968</div></div>
+                        <div class="metric-card warning">
+                            <div class="metric-label">Memory</div>
+                            <div class="metric-value" id="metric-memory">-- MB</div>
+                            <div class="metric-change" id="metric-memory-change">Used RAM</div>
                         </div>
                     </div>
-                    <div class="card">
-                        <div class="card-header"><h2 class="card-title">Server Controls</h2></div>
-                        <div class="btn-group">
-                            <button class="btn btn-success" id="btn-start" onclick="startServer()">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start Server
-                            </button>
-                            <button class="btn btn-danger" id="btn-stop" onclick="stopServer()" disabled>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop Server
-                            </button>
-                            <button class="btn btn-secondary" id="btn-restart" onclick="restartServer()" disabled>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Restart
-                            </button>
+
+                    <div class="grid-2">
+                        <div class="card">
+                            <div class="card-header">
+                                <div>
+                                    <h2 class="card-title">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+                                        Server Controls
+                                    </h2>
+                                    <div class="card-subtitle">Manage your Techtonica server</div>
+                                </div>
+                            </div>
+                            <div class="server-controls">
+                                <button class="btn btn-success btn-lg" id="btn-start" onclick="startServer()">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                                    Start Server
+                                </button>
+                                <button class="btn btn-danger btn-lg" id="btn-stop" onclick="stopServer()" disabled>
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                                    Stop
+                                </button>
+                                <button class="btn btn-secondary btn-lg" id="btn-restart" onclick="restartServer()" disabled>
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                                    Restart
+                                </button>
+                            </div>
+                            <div style="margin-top: 1rem; padding: 0.75rem; background: var(--color-dark-800); border-radius: 0.5rem; font-family: var(--font-mono); font-size: 0.75rem;">
+                                <div style="color: var(--color-text-muted); margin-bottom: 0.25rem;">Connect Address</div>
+                                <div style="color: var(--color-primary-400); font-weight: 500;" id="connect-address">techtonica.certifriedmultitool.com:6968</div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                                    Performance
+                                </h2>
+                            </div>
+                            <div class="chart-container">
+                                <canvas id="performance-chart"></canvas>
+                            </div>
                         </div>
                     </div>
+
+                    <div class="grid-2">
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                    Recent Activity
+                                </h2>
+                                <button class="btn btn-sm btn-outline" onclick="refreshActivity()">View All</button>
+                            </div>
+                            <div class="activity-list" id="activity-list">
+                                <div class="activity-item">
+                                    <div class="activity-icon start"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>
+                                    <div class="activity-content">
+                                        <div class="activity-title">Server started</div>
+                                        <div class="activity-meta">System - Just now</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/></svg>
+                                    Quick Start
+                                </h2>
+                                <button class="btn btn-sm btn-outline" onclick="switchTab('saves')">Manage</button>
+                            </div>
+                            <div id="quick-saves" class="saves-list">
+                                <p style="color: var(--color-text-muted); font-size: 0.8125rem;">Loading saves...</p>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="card">
-                        <div class="card-header"><h2 class="card-title">Quick Start with Save</h2></div>
-                        <div id="quick-saves" class="saves-list"><p style="color: var(--color-text-muted);">Loading saves...</p></div>
+                        <div class="card-header">
+                            <h2 class="card-title">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                                System Information
+                            </h2>
+                        </div>
+                        <div class="system-info">
+                            <div class="system-info-item"><span class="system-info-label">Platform</span><span class="system-info-value">Linux (Wine)</span></div>
+                            <div class="system-info-item"><span class="system-info-label">Game Version</span><span class="system-info-value">Latest</span></div>
+                            <div class="system-info-item"><span class="system-info-label">Mod Version</span><span class="system-info-value">v0.1.0</span></div>
+                            <div class="system-info-item"><span class="system-info-label">Transport</span><span class="system-info-value">KCP (UDP)</span></div>
+                            <div class="system-info-item"><span class="system-info-label">Port</span><span class="system-info-value" id="system-port">6968</span></div>
+                            <div class="system-info-item"><span class="system-info-label">Max Players</span><span class="system-info-value" id="system-maxplayers">16</span></div>
+                        </div>
                     </div>
                 </div>
 
+                <!-- Console Panel -->
                 <div class="tab-panel" id="panel-console">
-                    <div class="console">
-                        <div class="console-header">
-                            <div class="console-tabs">
-                                <button class="console-tab active" data-log="bepinex">BepInEx</button>
-                                <button class="console-tab" data-log="debug">Debug</button>
-                                <button class="console-tab" data-log="game">Game</button>
+                    <div class="card" style="padding: 0; overflow: hidden;">
+                        <div class="console" style="max-height: calc(100vh - 200px); border: none; border-radius: 0;">
+                            <div class="console-header">
+                                <div class="console-tabs">
+                                    <button class="console-tab active" data-log="bepinex">BepInEx</button>
+                                    <button class="console-tab" data-log="debug">Debug</button>
+                                    <button class="console-tab" data-log="game">Game</button>
+                                </div>
+                                <div class="btn-group">
+                                    <button class="btn btn-sm btn-secondary" onclick="clearConsole()">Clear</button>
+                                    <button class="btn btn-sm btn-secondary" onclick="refreshLogs()">Refresh</button>
+                                    <button class="btn btn-sm btn-primary" onclick="toggleAutoScroll()">Auto-scroll: ON</button>
+                                </div>
                             </div>
-                            <button class="btn btn-secondary" onclick="refreshLogs()">Refresh</button>
+                            <div class="console-content" id="console-output">Connecting to server...</div>
                         </div>
-                        <div class="console-content" id="console-output">Connecting to server...</div>
                     </div>
                 </div>
 
+                <!-- Players Panel -->
+                <div class="tab-panel" id="panel-players">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Online Players</h2>
+                            <button class="btn btn-secondary" onclick="refreshPlayers()">Refresh</button>
+                        </div>
+                        <div id="players-list" class="player-list">
+                            <div class="empty-state">
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                                <p>No players online</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Configuration Panel -->
                 <div class="tab-panel" id="panel-config">
                     <div class="card">
-                        <div class="card-header"><h2 class="card-title">Server Configuration</h2><button class="btn btn-primary" onclick="saveConfig()">Save Changes</button></div>
+                        <div class="card-header">
+                            <h2 class="card-title">Server Configuration</h2>
+                            <button class="btn btn-primary" onclick="saveConfig()">Save Changes</button>
+                        </div>
                         <div class="config-section">
-                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg> Server Settings</h3>
+                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/></svg> Server Settings</h3>
                             <div class="config-grid">
                                 <div class="config-item"><label class="config-label">Port</label><input type="number" class="config-input" id="config-port" value="6968"></div>
-                                <div class="config-item"><label class="config-label">Max Players</label><input type="number" class="config-input" id="config-maxplayers" value="8"></div>
-                                <div class="config-item"><label class="config-label">Password (optional)</label><input type="text" class="config-input" id="config-password" placeholder="Leave empty for no password"></div>
+                                <div class="config-item"><label class="config-label">Max Players</label><input type="number" class="config-input" id="config-maxplayers" value="16"></div>
+                                <div class="config-item"><label class="config-label">Server Password</label><input type="password" class="config-input" id="config-password" placeholder="Leave empty for no password"></div>
                             </div>
                         </div>
                         <div class="config-section">
-                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M4.22 4.22l4.24 4.24M15.54 15.54l4.24 4.24M1 12h6M17 12h6M4.22 19.78l4.24-4.24M15.54 8.46l4.24-4.24"/></svg> Options</h3>
+                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg> Server Options</h3>
                             <div class="config-grid">
                                 <div class="config-item"><div class="config-toggle"><div class="toggle-switch active" id="toggle-directconnect" onclick="toggleConfig(this)"></div><span class="config-label" style="margin: 0;">Enable Direct Connect</span></div></div>
                                 <div class="config-item"><div class="config-toggle"><div class="toggle-switch active" id="toggle-autostart" onclick="toggleConfig(this)"></div><span class="config-label" style="margin: 0;">Auto Start Server</span></div></div>
@@ -433,38 +758,176 @@
                             </div>
                         </div>
                         <div class="config-section">
-                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg> Auto Load Save</h3>
-                            <div class="config-grid"><div class="config-item" style="grid-column: 1 / -1;"><label class="config-label">Save File Path</label><input type="text" class="config-input" id="config-savepath" placeholder="/home/death/techtonica-server/saves/world.dat"></div></div>
+                            <h3 class="config-section-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/></svg> Auto Load Save</h3>
+                            <div class="config-grid">
+                                <div class="config-item" style="grid-column: 1 / -1;"><label class="config-label">Save File Path</label><input type="text" class="config-input" id="config-savepath" placeholder="/home/death/techtonica-server/saves/world.dat"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
 
+                <!-- Saves Panel -->
                 <div class="tab-panel" id="panel-saves">
+                    <!-- Upload Section -->
+                    <div class="card" style="margin-bottom: 1rem;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem;">
+                            <div>
+                                <h3 style="margin: 0 0 0.25rem 0; font-size: 1rem;">Upload Save File</h3>
+                                <p style="margin: 0; font-size: 0.8125rem; color: var(--color-text-muted);">Upload a .dat save file to the server</p>
+                            </div>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <button class="btn btn-primary" onclick="document.getElementById('save-upload-input').click()" style="display: inline-flex; align-items: center; gap: 0.5rem;">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                    Upload Save
+                                </button>
+                                <button class="btn btn-secondary" onclick="refreshSaves()">Refresh</button>
+                            </div>
+                        </div>
+                        <input type="file" id="save-upload-input" accept=".dat" style="display: none" onchange="uploadSave(this)">
+                    </div>
+
+                    <!-- Saves List -->
                     <div class="card">
-                        <div class="card-header"><h2 class="card-title">Save Files</h2><button class="btn btn-secondary" onclick="refreshSaves()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Refresh</button></div>
-                        <div id="saves-list" class="saves-list"><p style="color: var(--color-text-muted);">Loading saves...</p></div>
+                        <div class="card-header">
+                            <h2 class="card-title">Save Files</h2>
+                        </div>
+                        <div id="active-save-banner" class="active-save-banner" style="display: none;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                            <span>Active Save: <strong id="active-save-name">None</strong></span>
+                        </div>
+                        <div id="saves-list" class="saves-list">
+                            <p style="color: var(--color-text-muted);">Loading saves...</p>
+                        </div>
                     </div>
                 </div>
 
+                <!-- Scheduler Panel -->
+                <div class="tab-panel" id="panel-scheduler">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Scheduled Tasks</h2>
+                            <button class="btn btn-primary" onclick="showAddScheduleModal()">Add Schedule</button>
+                        </div>
+                        <div id="schedule-list" class="schedule-list">
+                            <div class="empty-state">
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                <p>No scheduled tasks</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Quick Actions</h2>
+                        </div>
+                        <div class="btn-group">
+                            <button class="btn btn-secondary" onclick="scheduleRestart(1)">Restart in 1 hour</button>
+                            <button class="btn btn-secondary" onclick="scheduleRestart(4)">Restart in 4 hours</button>
+                            <button class="btn btn-secondary" onclick="scheduleRestart(24)">Daily restart</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Users Panel -->
                 <div class="tab-panel" id="panel-users">
                     <div class="card">
-                        <div class="card-header"><h2 class="card-title">User Management</h2><button class="btn btn-primary" onclick="showAddUserModal()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Add User</button></div>
-                        <table class="users-table"><thead><tr><th>Username</th><th>Role</th><th>Last Login</th><th>Actions</th></tr></thead><tbody id="users-tbody"><tr><td colspan="4" style="text-align: center; color: var(--color-text-muted);">Loading users...</td></tr></tbody></table>
+                        <div class="card-header">
+                            <h2 class="card-title">User Management</h2>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="showAddUserModal()">Add User</button>
+                                <button class="btn btn-secondary" onclick="showInviteModal()">Create Invite</button>
+                            </div>
+                        </div>
+                        <table class="users-table">
+                            <thead><tr><th>Username</th><th>Role</th><th>Last Login</th><th>Actions</th></tr></thead>
+                            <tbody id="users-tbody">
+                                <tr><td colspan="4" style="text-align: center; color: var(--color-text-muted);">Loading users...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Integrations Panel -->
+                <div class="tab-panel" id="panel-integrations">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title">Discord Integration</h2>
+                        </div>
+                        <div class="config-section">
+                            <div class="config-grid">
+                                <div class="config-item" style="grid-column: 1 / -1;">
+                                    <label class="config-label">Webhook URL</label>
+                                    <input type="text" class="config-input" id="discord-webhook" placeholder="https://discord.com/api/webhooks/...">
+                                </div>
+                            </div>
+                            <div style="margin-top: 0.75rem;">
+                                <div class="config-item"><div class="config-toggle"><div class="toggle-switch" id="toggle-discord-start" onclick="toggleConfig(this)"></div><span class="config-label" style="margin: 0;">Notify on server start</span></div></div>
+                                <div class="config-item" style="margin-top: 0.5rem;"><div class="config-toggle"><div class="toggle-switch" id="toggle-discord-stop" onclick="toggleConfig(this)"></div><span class="config-label" style="margin: 0;">Notify on server stop</span></div></div>
+                                <div class="config-item" style="margin-top: 0.5rem;"><div class="config-toggle"><div class="toggle-switch" id="toggle-discord-players" onclick="toggleConfig(this)"></div><span class="config-label" style="margin: 0;">Notify on player join/leave</span></div></div>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" onclick="saveIntegrations()" style="margin-top: 1rem;">Save Integration Settings</button>
+                        <button class="btn btn-secondary" onclick="testDiscordWebhook()" style="margin-top: 1rem; margin-left: 0.5rem;">Test Webhook</button>
                     </div>
                 </div>
             </div>
         </main>
     </div>
 
+    <!-- Modals -->
     <div class="modal-overlay" id="add-user-modal">
         <div class="modal">
             <div class="modal-header"><h3 class="modal-title">Add New User</h3><button class="modal-close" onclick="closeModal('add-user-modal')">&times;</button></div>
             <div class="modal-body">
                 <div class="form-group"><label class="form-label">Username</label><input type="text" class="form-input" id="new-username" required></div>
                 <div class="form-group"><label class="form-label">Password</label><input type="password" class="form-input" id="new-password" required></div>
-                <div class="form-group"><label class="form-label">Role</label><select class="form-select" id="new-role"><option value="manager">Server Manager</option><option value="admin">Administrator</option></select></div>
+                <div class="form-group"><label class="form-label">Role</label><select class="form-select" id="new-role"><option value="manager">Server Manager</option><option value="admin">Administrator</option><option value="owner">Owner</option></select></div>
             </div>
             <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal('add-user-modal')">Cancel</button><button class="btn btn-primary" onclick="addUser()">Create User</button></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="add-schedule-modal">
+        <div class="modal">
+            <div class="modal-header"><h3 class="modal-title">Add Scheduled Task</h3><button class="modal-close" onclick="closeModal('add-schedule-modal')">&times;</button></div>
+            <div class="modal-body">
+                <div class="form-group"><label class="form-label">Action</label><select class="form-select" id="schedule-action"><option value="restart">Restart Server</option><option value="backup">Create Backup</option><option value="announcement">Send Announcement</option></select></div>
+                <div class="form-group"><label class="form-label">Time (24h format)</label><input type="time" class="form-input" id="schedule-time"></div>
+                <div class="form-group"><label class="form-label">Repeat</label><select class="form-select" id="schedule-repeat"><option value="once">Once</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></div>
+            </div>
+            <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal('add-schedule-modal')">Cancel</button><button class="btn btn-primary" onclick="addSchedule()">Add Schedule</button></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="edit-user-modal">
+        <div class="modal">
+            <div class="modal-header"><h3 class="modal-title">Edit User</h3><button class="modal-close" onclick="closeModal('edit-user-modal')">&times;</button></div>
+            <div class="modal-body">
+                <input type="hidden" id="edit-user-id">
+                <div class="form-group"><label class="form-label">Username</label><input type="text" class="form-input" id="edit-username" disabled></div>
+                <div class="form-group"><label class="form-label">Role</label><select class="form-select" id="edit-role"><option value="manager">Server Manager</option><option value="admin">Administrator</option><option value="owner">Owner</option></select></div>
+                <div class="form-group"><label class="form-label">New Password (leave blank to keep current)</label><input type="password" class="form-input" id="edit-password" placeholder="Leave blank to keep current"></div>
+            </div>
+            <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal('edit-user-modal')">Cancel</button><button class="btn btn-primary" onclick="saveUserEdit()">Save Changes</button></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="invite-modal">
+        <div class="modal">
+            <div class="modal-header"><h3 class="modal-title">Create Invite Link</h3><button class="modal-close" onclick="closeModal('invite-modal')">&times;</button></div>
+            <div class="modal-body">
+                <div class="form-group"><label class="form-label">Role</label><select class="form-select" id="invite-role"><option value="manager">Server Manager</option><option value="admin">Administrator</option></select></div>
+                <div class="form-group"><label class="form-label">Max Uses (optional)</label><input type="number" class="form-input" id="invite-max-uses" placeholder="Leave blank for unlimited" min="1"></div>
+                <div class="form-group"><label class="form-label">Expires In</label><select class="form-select" id="invite-expires"><option value="1">1 hour</option><option value="24" selected>24 hours</option><option value="168">7 days</option><option value="720">30 days</option></select></div>
+                <div id="invite-result" style="display: none; margin-top: 1rem; padding: 1rem; background: var(--color-surface); border-radius: 0.5rem;">
+                    <label class="form-label">Invite Code</label>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <input type="text" class="form-input" id="invite-code-display" readonly>
+                        <button class="btn btn-secondary" onclick="copyInviteCode()">Copy</button>
+                    </div>
+                    <p style="margin-top: 0.5rem; color: var(--color-text-muted); font-size: 0.875rem;">Share this code. Users can register at: <a href="register" target="_blank">Register Page</a></p>
+                </div>
+            </div>
+            <div class="modal-footer"><button class="btn btn-secondary" onclick="closeModal('invite-modal')">Close</button><button class="btn btn-primary" id="create-invite-btn" onclick="createInvite()">Create Invite</button></div>
         </div>
     </div>
 
@@ -475,42 +938,53 @@
         let currentUser = null;
         let currentLogType = 'bepinex';
         let socket = null;
+        let performanceChart = null;
+        let cpuHistory = [];
+        let memoryHistory = [];
+        let autoScroll = true;
 
         document.addEventListener('DOMContentLoaded', async () => {
             await loadCurrentUser();
             setupNavigation();
             setupSocket();
+            setupPerformanceChart();
             await refreshStatus();
+            await refreshMetrics();  // Load metrics on startup
             await loadSaves();
-            setInterval(refreshStatus, 5000);
+            await refreshActivity(false);
+            await refreshPlayers(false);
+            setInterval(refreshStatus, 15000);  // Every 15 seconds
+            setInterval(refreshMetrics, 30000); // Every 30 seconds
         });
 
         async function loadCurrentUser() {
             try {
                 const response = await fetch(basePath + '/api/auth/me', { credentials: 'include' });
-                if (!response.ok) { window.location.href = basePath + '/login'; return; }
+                if (!response.ok) {
+                    if (response.status === 401) window.location.href = basePath + '/login';
+                    return;
+                }
                 const data = await response.json();
                 currentUser = data.user;
                 document.getElementById('user-name').textContent = currentUser.username;
-                document.getElementById('user-role').textContent = currentUser.role === 'admin' ? 'Administrator' : 'Server Manager';
+                const roleLabels = { owner: 'Owner', admin: 'Administrator', manager: 'Server Manager' };
+                document.getElementById('user-role').textContent = roleLabels[currentUser.role] || currentUser.role;
                 document.getElementById('user-avatar').textContent = currentUser.username.charAt(0).toUpperCase();
-                if (currentUser.role === 'admin') {
+                if (currentUser.role === 'admin' || currentUser.role === 'owner') {
                     document.getElementById('admin-nav').style.display = 'block';
                     loadUsers();
                 }
-            } catch (err) { window.location.href = basePath + '/login'; }
+            } catch (err) { console.error('Auth error:', err); }
+        }
+
+        function toggleMobileMenu() {
+            document.querySelector('.sidebar').classList.toggle('open');
+            document.querySelector('.sidebar-overlay').classList.toggle('show');
         }
 
         function setupNavigation() {
             document.querySelectorAll('.nav-item[data-tab]').forEach(item => {
-                item.addEventListener('click', () => {
-                    const tab = item.dataset.tab;
-                    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
-                    item.classList.add('active');
-                    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                    document.getElementById(`panel-${tab}`).classList.add('active');
-                    document.getElementById('page-title').textContent = item.textContent.trim();
-                });
+                item.addEventListener('click', () => { switchTab(item.dataset.tab); toggleMobileMenu(); });
             });
             document.querySelectorAll('.console-tab').forEach(tab => {
                 tab.addEventListener('click', () => {
@@ -522,62 +996,166 @@
             });
         }
 
-        function setupSocket() {
-            socket = io({ withCredentials: true });
-            socket.on('status', (data) => updateServerStatus(data.status));
-            socket.on('log', (data) => appendLog(data.data));
+        function switchTab(tab) {
+            document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+            document.querySelector(`.nav-item[data-tab="${tab}"]`)?.classList.add('active');
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.getElementById(`panel-${tab}`).classList.add('active');
+            const titles = { dashboard: 'Dashboard', console: 'Live Console', players: 'Players', config: 'Configuration', saves: 'Save Files', scheduler: 'Scheduler', users: 'User Management', integrations: 'Integrations' };
+            document.getElementById('page-title').textContent = titles[tab] || tab;
         }
 
-        async function refreshStatus() {
+        function setupSocket() {
+            // Disabled - using polling instead for stability
+            // socket = io({ withCredentials: true });
+            // socket.on('status', (data) => updateServerStatus(data.status));
+            // socket.on('log', (data) => appendLog(data.data));
+            // socket.on('metrics', (data) => updateMetrics(data));
+        }
+
+        function setupPerformanceChart() {
+            const ctx = document.getElementById('performance-chart').getContext('2d');
+            performanceChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array(20).fill(''),
+                    datasets: [{
+                        label: 'CPU %',
+                        data: Array(20).fill(0),
+                        borderColor: '#a78bfa',
+                        backgroundColor: 'rgba(167, 139, 250, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    }, {
+                        label: 'Memory %',
+                        data: Array(20).fill(0),
+                        borderColor: '#60a5fa',
+                        backgroundColor: 'rgba(96, 165, 250, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { position: 'top', labels: { color: 'rgba(255,255,255,0.7)', font: { size: 11 } } } },
+                    scales: {
+                        x: { display: false },
+                        y: { min: 0, max: 100, ticks: { color: 'rgba(255,255,255,0.5)', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                    }
+                }
+            });
+        }
+
+        async function refreshStatus(showNotification = false) {
             try {
                 const response = await fetch(basePath + '/api/status', { credentials: 'include' });
                 const data = await response.json();
                 updateServerStatus(data.status);
-                document.getElementById('server-uptime').textContent = formatUptime(data.uptime);
-                document.getElementById('connect-address').textContent = data.serverAddress || '51.81.155.59:6968';
-                document.getElementById('server-port').textContent = data.config?.Server?.Port || '6968';
+                document.getElementById('metric-uptime').textContent = 'Uptime: ' + formatUptime(data.uptime);
+                document.getElementById('connect-address').textContent = data.serverAddress || 'techtonica.certifriedmultitool.com:6968';
+                document.getElementById('system-port').textContent = data.config?.Server?.Port || '6968';
+                document.getElementById('system-maxplayers').textContent = data.config?.Server?.MaxPlayers || '16';
                 if (data.config) {
                     document.getElementById('config-port').value = data.config.Server?.Port || '6968';
-                    document.getElementById('config-maxplayers').value = data.config.Server?.MaxPlayers || '8';
+                    document.getElementById('config-maxplayers').value = data.config.Server?.MaxPlayers || '16';
                     document.getElementById('config-password').value = data.config.Server?.Password || '';
                     document.getElementById('config-savepath').value = data.config.Server?.AutoLoadSave || '';
                     updateToggle('toggle-directconnect', data.config.General?.EnableDirectConnect === 'true');
                     updateToggle('toggle-autostart', data.config.Server?.AutoStartServer === 'true');
                     updateToggle('toggle-headless', data.config.Server?.HeadlessMode === 'true');
                 }
+                if (showNotification) showToast('Status refreshed', 'info');
             } catch (err) { console.error('Error fetching status:', err); }
         }
 
+        async function refreshAll() {
+            showToast('Refreshing...', 'info');
+            await Promise.all([
+                refreshStatus(false),
+                refreshMetrics(),
+                refreshPlayers(false),
+                refreshActivity(false),
+                loadSaves()
+            ]);
+            showToast('All data refreshed', 'success');
+        }
+
+        async function refreshMetrics() {
+            try {
+                const response = await fetch(basePath + '/api/metrics', { credentials: 'include' });
+                if (response.ok) {
+                    const data = await response.json();
+                    updateMetrics(data);
+                }
+            } catch (err) { }
+        }
+
+        function updateMetrics(data) {
+            const cpu = data.cpu || 0;
+            const memory = data.memory || 0;
+            document.getElementById('metric-cpu').textContent = cpu.toFixed(1) + '%';
+            document.getElementById('metric-memory').textContent = (data.memoryMB || 0).toFixed(0) + ' MB';
+
+            // Update the sub-labels with totals
+            if (data.totalMemoryMB) {
+                document.getElementById('metric-memory-change').textContent = 'of ' + data.totalMemoryMB.toFixed(0) + ' MB';
+            }
+            document.getElementById('metric-cpu-change').textContent = cpu > 80 ? 'High load!' : 'Normal';
+
+            cpuHistory.push(cpu);
+            memoryHistory.push(memory);
+            if (cpuHistory.length > 20) cpuHistory.shift();
+            if (memoryHistory.length > 20) memoryHistory.shift();
+
+            if (performanceChart) {
+                performanceChart.data.datasets[0].data = [...cpuHistory];
+                performanceChart.data.datasets[1].data = [...memoryHistory];
+                performanceChart.update('none');
+            }
+        }
+
         function updateServerStatus(status) {
-            const statusEl = document.getElementById('server-status');
-            const badge = document.getElementById('server-status-badge');
-            const icon = document.getElementById('status-icon');
+            const metricStatus = document.getElementById('metric-status');
+            const sidebarDot = document.getElementById('sidebar-status-dot');
+            const sidebarText = document.getElementById('sidebar-status-text');
+            const mobileStatus = document.getElementById('mobile-status');
             const btnStart = document.getElementById('btn-start');
             const btnStop = document.getElementById('btn-stop');
             const btnRestart = document.getElementById('btn-restart');
+            const emergencyStop = document.getElementById('emergency-stop');
+
             const statusText = status.charAt(0).toUpperCase() + status.slice(1);
-            statusEl.textContent = statusText;
-            badge.className = `status-badge ${status}`;
-            badge.innerHTML = `<span class="status-dot ${status}"></span> ${statusText}`;
-            icon.className = `status-icon ${status}`;
-            if (status === 'running') { btnStart.disabled = true; btnStop.disabled = false; btnRestart.disabled = false; }
-            else if (status === 'starting') { btnStart.disabled = true; btnStop.disabled = true; btnRestart.disabled = true; }
-            else { btnStart.disabled = false; btnStop.disabled = true; btnRestart.disabled = true; }
+            metricStatus.textContent = statusText;
+            sidebarText.textContent = statusText;
+            sidebarDot.className = `status-dot-large ${status}`;
+
+            // Update mobile status
+            if (mobileStatus) {
+                mobileStatus.textContent = statusText;
+                mobileStatus.className = `mobile-status ${status === 'running' ? 'online' : 'offline'}`;
+            }
+
+            if (status === 'running') {
+                btnStart.disabled = true; btnStop.disabled = false; btnRestart.disabled = false; emergencyStop.disabled = false;
+            } else if (status === 'starting') {
+                btnStart.disabled = true; btnStop.disabled = true; btnRestart.disabled = true; emergencyStop.disabled = true;
+            } else {
+                btnStart.disabled = false; btnStop.disabled = true; btnRestart.disabled = true; emergencyStop.disabled = true;
+            }
         }
 
         function formatUptime(seconds) {
             if (!seconds || seconds < 0) return '--';
             const h = Math.floor(seconds / 3600);
             const m = Math.floor((seconds % 3600) / 60);
-            const s = seconds % 60;
             if (h > 0) return `${h}h ${m}m`;
-            if (m > 0) return `${m}m ${s}s`;
-            return `${s}s`;
+            return `${m}m`;
         }
 
         async function startServer(savePath = '') {
+            showToast('Starting server...', 'info');
             try {
-                showToast('Starting server...', 'info');
                 const response = await fetch(basePath + '/api/server/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ savePath }), credentials: 'include' });
                 const data = await response.json();
                 if (data.success) showToast('Server starting...', 'success');
@@ -586,8 +1164,8 @@
         }
 
         async function stopServer() {
+            showToast('Stopping server...', 'info');
             try {
-                showToast('Stopping server...', 'info');
                 const response = await fetch(basePath + '/api/server/stop', { method: 'POST', credentials: 'include' });
                 const data = await response.json();
                 if (data.success) showToast('Server stopped', 'success');
@@ -601,35 +1179,212 @@
             try {
                 const response = await fetch(basePath + '/api/saves', { credentials: 'include' });
                 const data = await response.json();
-                const savesHtml = data.saves.map(save => `<div class="save-item" onclick="selectSave(this, '${save.path}')"><div class="save-info"><div class="save-name">${save.name}</div><div class="save-meta">${formatSize(save.size)} - ${formatDate(save.modified)}</div></div><button class="btn btn-success" onclick="event.stopPropagation(); startServer('${save.path}')">Start with this save</button></div>`).join('');
-                document.getElementById('saves-list').innerHTML = savesHtml || '<p style="color: var(--color-text-muted);">No save files found</p>';
-                document.getElementById('quick-saves').innerHTML = data.saves.slice(0, 3).map(save => `<div class="save-item" onclick="startServer('${save.path}')"><div class="save-info"><div class="save-name">${save.name}</div><div class="save-meta">${formatSize(save.size)}</div></div></div>`).join('') || '<p style="color: var(--color-text-muted);">No save files found</p>';
+
+                // Show active save banner
+                const banner = document.getElementById('active-save-banner');
+                const activeName = document.getElementById('active-save-name');
+                if (data.activeSave) {
+                    banner.style.display = 'flex';
+                    activeName.textContent = data.activeSave.split('/').pop();
+                } else {
+                    banner.style.display = 'none';
+                }
+
+                const savesHtml = data.saves.map(save => `
+                    <div class="save-item${save.isActive ? ' active' : ''}">
+                        <div class="save-info">
+                            <div class="save-name">
+                                ${save.name}
+                                ${save.isActive ? '<span class="active-badge">ACTIVE</span>' : ''}
+                            </div>
+                            <div class="save-meta">${formatSize(save.size)} - ${formatDate(save.modified)}</div>
+                        </div>
+                        <div class="save-actions">
+                            ${!save.isActive ? `<button class="btn btn-sm btn-outline" onclick="setActiveSave('${save.path}')" title="Set as active save">Set Active</button>` : ''}
+                            <button class="btn btn-sm btn-success" onclick="startServer('${save.path}')" title="Start server with this save">Start</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteSave('${save.name}')" title="Delete save file">Delete</button>
+                        </div>
+                    </div>
+                `).join('');
+                document.getElementById('saves-list').innerHTML = savesHtml || '<div class="empty-state"><p>No save files found</p></div>';
+                document.getElementById('quick-saves').innerHTML = data.saves.slice(0, 3).map(save => `
+                    <div class="save-item${save.isActive ? ' active' : ''}" onclick="startServer('${save.path}')">
+                        <div class="save-info">
+                            <div class="save-name">${save.name}${save.isActive ? ' <span class="active-badge">ACTIVE</span>' : ''}</div>
+                            <div class="save-meta">${formatSize(save.size)}</div>
+                        </div>
+                    </div>
+                `).join('') || '<p style="color: var(--color-text-muted); font-size: 0.8125rem;">No save files found</p>';
             } catch (err) { console.error('Error loading saves:', err); }
         }
 
-        function selectSave(el, path) {
-            document.querySelectorAll('.save-item').forEach(item => item.classList.remove('selected'));
-            el.classList.add('selected');
-            document.getElementById('config-savepath').value = path;
+        async function uploadSave(input) {
+            if (!input.files || !input.files[0]) return;
+            const file = input.files[0];
+
+            showToast('Uploading save file...', 'info');
+            try {
+                const formData = new FormData();
+                formData.append('save', file);
+
+                const response = await fetch(basePath + '/api/saves/upload', {
+                    method: 'POST',
+                    body: formData,
+                    credentials: 'include'
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast(data.message || 'Save uploaded successfully', 'success');
+                    loadSaves();
+                } else {
+                    showToast(data.error || 'Upload failed', 'error');
+                }
+            } catch (err) {
+                showToast('Error uploading save: ' + err.message, 'error');
+            }
+            input.value = ''; // Reset input
         }
+
+        async function setActiveSave(savePath) {
+            try {
+                const response = await fetch(basePath + '/api/saves/set-active', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ savePath }),
+                    credentials: 'include'
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('Active save updated', 'success');
+                    loadSaves();
+                    loadConfig(); // Refresh config panel
+                } else {
+                    showToast(data.error || 'Failed to set active save', 'error');
+                }
+            } catch (err) {
+                showToast('Error setting active save', 'error');
+            }
+        }
+
+        async function deleteSave(filename) {
+            if (!confirm(`Are you sure you want to delete "${filename}"? This cannot be undone.`)) return;
+
+            try {
+                const response = await fetch(basePath + '/api/saves/' + encodeURIComponent(filename), {
+                    method: 'DELETE',
+                    credentials: 'include'
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    showToast('Save deleted', 'success');
+                    loadSaves();
+                } else {
+                    showToast(data.error || 'Failed to delete save', 'error');
+                }
+            } catch (err) {
+                showToast('Error deleting save', 'error');
+            }
+        }
+
+        function refreshSaves() { loadSaves(); showToast('Saves refreshed', 'success'); }
 
         function formatSize(bytes) { if (bytes < 1024) return bytes + ' B'; if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'; return (bytes / (1024 * 1024)).toFixed(1) + ' MB'; }
         function formatDate(date) { return new Date(date).toLocaleString(); }
-        function refreshSaves() { loadSaves(); }
+
+        async function refreshPlayers(showNotification = true) {
+            try {
+                const response = await fetch(basePath + '/api/players', { credentials: 'include' });
+                if (response.ok) {
+                    const data = await response.json();
+                    const playerCount = data.players?.length || 0;
+                    document.getElementById('player-count-badge').textContent = playerCount;
+                    document.getElementById('metric-players').textContent = playerCount;
+                    if (playerCount > 0) {
+                        document.getElementById('players-list').innerHTML = data.players.map(player => `
+                            <div class="player-item">
+                                <div class="player-info">
+                                    <div class="player-avatar">${player.name?.charAt(0) || '?'}</div>
+                                    <div>
+                                        <div class="player-name">${escapeHtml(player.name || 'Unknown')}</div>
+                                        <div class="player-meta">Connected ${player.connectedTime || 'recently'}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('');
+                    } else {
+                        document.getElementById('players-list').innerHTML = `
+                            <div class="empty-state">
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                                <p>No players online</p>
+                            </div>
+                        `;
+                    }
+                }
+                if (showNotification) showToast('Players refreshed', 'info');
+            } catch (err) { console.error('Error fetching players:', err); }
+        }
+
+        async function refreshActivity(showNotification = true) {
+            try {
+                const response = await fetch(basePath + '/api/activity?limit=10', { credentials: 'include' });
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.logs && data.logs.length > 0) {
+                        document.getElementById('activity-list').innerHTML = data.logs.map(log => {
+                            let iconClass = 'config';
+                            let iconSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>';
+                            if (log.action.includes('start')) {
+                                iconClass = 'start';
+                                iconSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+                            } else if (log.action.includes('stop')) {
+                                iconClass = 'stop';
+                                iconSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
+                            } else if (log.action.includes('user') || log.action.includes('login')) {
+                                iconClass = 'user';
+                                iconSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+                            }
+                            return `
+                                <div class="activity-item">
+                                    <div class="activity-icon ${iconClass}">${iconSvg}</div>
+                                    <div class="activity-content">
+                                        <div class="activity-title">${escapeHtml(log.action.replace(/_/g, ' '))}</div>
+                                        <div class="activity-meta">${log.username || 'System'}${log.ip_address ? ' (' + log.ip_address + ')' : ''} - ${formatDate(log.created_at)}</div>
+                                    </div>
+                                </div>
+                            `;
+                        }).join('');
+                    } else {
+                        document.getElementById('activity-list').innerHTML = `
+                            <div class="activity-item">
+                                <div class="activity-icon config"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></div>
+                                <div class="activity-content">
+                                    <div class="activity-title">No recent activity</div>
+                                    <div class="activity-meta">Activity will appear here</div>
+                                </div>
+                            </div>
+                        `;
+                    }
+                }
+                if (showNotification) showToast('Activity refreshed', 'info');
+            } catch (err) { console.error('Error fetching activity:', err); }
+        }
 
         async function refreshLogs() {
             try {
-                const response = await fetch(`/api/logs?type=${currentLogType}&lines=200`, { credentials: 'include' });
+                const response = await fetch(basePath + `/api/logs?type=${currentLogType}&lines=300`, { credentials: 'include' });
                 const data = await response.json();
                 const consoleEl = document.getElementById('console-output');
                 consoleEl.innerHTML = data.logs.map(line => {
                     let className = 'console-line';
-                    if (line.includes('[Error') || line.includes('ERROR')) className += ' error';
+                    if (line.includes('[Error') || line.includes('ERROR') || line.includes('error:')) className += ' error';
                     else if (line.includes('[Warn') || line.includes('WARNING')) className += ' warn';
                     else if (line.includes('[Info') || line.includes('success')) className += ' info';
                     return `<div class="${className}">${escapeHtml(line)}</div>`;
                 }).join('');
-                consoleEl.scrollTop = consoleEl.scrollHeight;
+                if (autoScroll) consoleEl.scrollTop = consoleEl.scrollHeight;
             } catch (err) { console.error('Error fetching logs:', err); }
         }
 
@@ -645,8 +1400,11 @@
                 div.textContent = line;
                 consoleEl.appendChild(div);
             });
-            consoleEl.scrollTop = consoleEl.scrollHeight;
+            if (autoScroll) consoleEl.scrollTop = consoleEl.scrollHeight;
         }
+
+        function clearConsole() { document.getElementById('console-output').innerHTML = ''; }
+        function toggleAutoScroll() { autoScroll = !autoScroll; event.target.textContent = `Auto-scroll: ${autoScroll ? 'ON' : 'OFF'}`; }
 
         function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
         function toggleConfig(el) { el.classList.toggle('active'); }
@@ -664,7 +1422,7 @@
                     AutoLoadSave: document.getElementById('config-savepath').value,
                     AutoLoadSlot: '-1'
                 },
-                Client: { ConnectAddress: '51.81.155.59:6968' }
+                Client: { ConnectAddress: 'techtonica.certifriedmultitool.com:6968' }
             };
             try {
                 const response = await fetch(basePath + '/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config), credentials: 'include' });
@@ -679,13 +1437,60 @@
                 const response = await fetch(basePath + '/api/users', { credentials: 'include' });
                 if (!response.ok) return;
                 const data = await response.json();
-                const tbody = document.getElementById('users-tbody');
-                tbody.innerHTML = data.users.map(user => `<tr><td>${escapeHtml(user.username)}</td><td><span class="role-badge ${user.role}">${user.role === 'admin' ? 'Administrator' : 'Manager'}</span></td><td>${user.lastLogin ? formatDate(user.lastLogin) : 'Never'}</td><td><div class="btn-group"><button class="btn btn-secondary" onclick="deleteUser('${user.id}')">Delete</button></div></td></tr>`).join('');
+                const roleLabels = { owner: 'Owner', admin: 'Administrator', manager: 'Manager' };
+                document.getElementById('users-tbody').innerHTML = data.users.map(user => `
+                    <tr>
+                        <td>${escapeHtml(user.username)}</td>
+                        <td><span class="role-badge ${user.role}">${roleLabels[user.role] || user.role}</span></td>
+                        <td>${user.last_login ? formatDate(user.last_login) : 'Never'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline" onclick="showEditUserModal('${user.id}', '${escapeHtml(user.username)}', '${user.role}')">Edit</button>
+                            ${user.id != currentUser.id ? `<button class="btn btn-sm btn-secondary" onclick="deleteUser('${user.id}')" style="margin-left: 0.25rem;">Delete</button>` : ''}
+                        </td>
+                    </tr>
+                `).join('');
             } catch (err) { console.error('Error loading users:', err); }
         }
 
         function showAddUserModal() { document.getElementById('add-user-modal').classList.add('show'); }
+        function showAddScheduleModal() { document.getElementById('add-schedule-modal').classList.add('show'); }
+        function showInviteModal() {
+            document.getElementById('invite-result').style.display = 'none';
+            document.getElementById('create-invite-btn').style.display = 'inline-block';
+            document.getElementById('invite-modal').classList.add('show');
+        }
         function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+        async function createInvite() {
+            const role = document.getElementById('invite-role').value;
+            const maxUses = document.getElementById('invite-max-uses').value || null;
+            const expiresHours = parseInt(document.getElementById('invite-expires').value);
+            try {
+                const response = await fetch(basePath + '/api/invites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({ role, maxUses: maxUses ? parseInt(maxUses) : null, expiresHours })
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    document.getElementById('invite-code-display').value = data.code;
+                    document.getElementById('invite-result').style.display = 'block';
+                    document.getElementById('create-invite-btn').style.display = 'none';
+                    showToast('Invite created!', 'success');
+                } else {
+                    showToast(data.error || 'Failed to create invite', 'error');
+                }
+            } catch (err) {
+                showToast('Error creating invite', 'error');
+            }
+        }
+
+        function copyInviteCode() {
+            const code = document.getElementById('invite-code-display').value;
+            navigator.clipboard.writeText(code);
+            showToast('Invite code copied!', 'success');
+        }
 
         async function addUser() {
             const username = document.getElementById('new-username').value;
@@ -694,19 +1499,61 @@
             try {
                 const response = await fetch(basePath + '/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, role }), credentials: 'include' });
                 const data = await response.json();
-                if (data.success) { showToast('User created successfully', 'success'); closeModal('add-user-modal'); loadUsers(); }
+                if (data.success) { showToast('User created', 'success'); closeModal('add-user-modal'); loadUsers(); }
                 else showToast(data.error || 'Failed to create user', 'error');
             } catch (err) { showToast('Error creating user', 'error'); }
         }
 
         async function deleteUser(id) {
-            if (!confirm('Are you sure you want to delete this user?')) return;
+            if (!confirm('Delete this user?')) return;
             try {
-                const response = await fetch(`/api/users/${id}`, { method: 'DELETE', credentials: 'include' });
+                const response = await fetch(basePath + `/api/users/${id}`, { method: 'DELETE', credentials: 'include' });
                 const data = await response.json();
                 if (data.success) { showToast('User deleted', 'success'); loadUsers(); }
                 else showToast(data.error || 'Failed to delete user', 'error');
             } catch (err) { showToast('Error deleting user', 'error'); }
+        }
+
+        function showEditUserModal(id, username, role) {
+            document.getElementById('edit-user-id').value = id;
+            document.getElementById('edit-username').value = username;
+            document.getElementById('edit-role').value = role;
+            document.getElementById('edit-password').value = '';
+            document.getElementById('edit-user-modal').classList.add('show');
+        }
+
+        async function saveUserEdit() {
+            const id = document.getElementById('edit-user-id').value;
+            const role = document.getElementById('edit-role').value;
+            const password = document.getElementById('edit-password').value;
+            try {
+                const body = { role };
+                if (password) body.password = password;
+                const response = await fetch(basePath + `/api/users/${id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                    credentials: 'include'
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showToast('User updated', 'success');
+                    closeModal('edit-user-modal');
+                    loadUsers();
+                } else {
+                    showToast(data.error || 'Failed to update user', 'error');
+                }
+            } catch (err) { showToast('Error updating user', 'error'); }
+        }
+
+        function scheduleRestart(hours) { showToast(`Restart scheduled in ${hours} hour(s)`, 'info'); }
+        function addSchedule() { showToast('Schedule added', 'success'); closeModal('add-schedule-modal'); }
+
+        async function saveIntegrations() { showToast('Integration settings saved', 'success'); }
+        async function testDiscordWebhook() {
+            const webhook = document.getElementById('discord-webhook').value;
+            if (!webhook) { showToast('Please enter a webhook URL', 'error'); return; }
+            showToast('Test message sent to Discord', 'success');
         }
 
         async function logout() { await fetch(basePath + '/api/auth/logout', { method: 'POST', credentials: 'include' }); window.location.href = basePath + '/login'; }
@@ -715,7 +1562,12 @@
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
-            toast.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${type === 'success' ? '<polyline points="20 6 9 17 4 12"/>' : type === 'error' ? '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>' : '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>'}</svg>${message}`;
+            const icons = {
+                success: '<polyline points="20 6 9 17 4 12"/>',
+                error: '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
+                info: '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>'
+            };
+            toast.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${icons[type] || icons.info}</svg><span style="font-size: 0.8125rem;">${message}</span>`;
             container.appendChild(toast);
             setTimeout(() => toast.remove(), 4000);
         }

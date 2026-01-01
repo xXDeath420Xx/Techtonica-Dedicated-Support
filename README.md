@@ -1,7 +1,10 @@
 # Techtonica Dedicated Server
 
+**Status: WORKING!** - Successfully tested January 2026
+
 Run 24/7 Techtonica multiplayer servers without Steam dependency.
 
+[![Status](https://img.shields.io/badge/Status-WORKING-brightgreen)](https://github.com/xXDeath420Xx/Techtonica)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)](https://github.com/xXDeath420Xx/Techtonica)
 
@@ -20,7 +23,7 @@ Run 24/7 Techtonica multiplayer servers without Steam dependency.
 
 1. Install [r2modman](https://thunderstore.io/package/ebkr/r2modman/)
 2. Search for "TechtonicaDirectConnect" and install
-3. Press F8 in-game to connect to a server
+3. Click "Join Multiplayer" from main menu OR press F11 to connect to a server
 
 ### For Server Hosts
 

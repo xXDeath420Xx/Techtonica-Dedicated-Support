@@ -1,5 +1,7 @@
 # Techtonica Dedicated Server - Windows Installation
 
+**Status: WORKING!** - Successfully tested January 2026
+
 Run a Techtonica dedicated server on Windows (Home PC or Windows Server).
 
 ## Quick Start

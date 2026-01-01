@@ -1,6 +1,8 @@
 # Techtonica Direct Connect
 
-Connect to Techtonica dedicated servers using direct IP addresses instead of Steam lobbies!
+**Status: WORKING** - Successfully tested with dedicated servers!
+
+Connect to Techtonica dedicated servers using direct IP addresses instead of Steam lobbies! Join 24/7 community servers without Steam lobbies or friend invites.
 
 ## Features
 
@@ -25,10 +27,11 @@ Connect to Techtonica dedicated servers using direct IP addresses instead of Ste
 ## Usage
 
 1. Launch Techtonica
-2. Press **F8** (configurable) to open the connect dialog
-3. Enter the server IP address and port
-4. Click "Connect"
-5. To disconnect, press F8 again and click "Disconnect"
+2. From the **Main Menu**, click the **"Join Multiplayer"** button (enabled by this mod)
+3. Or press **F11** to open the connect dialog from anywhere
+4. Enter the server IP address and port (default: 6968)
+5. Click "Connect" - the game will load and connect automatically
+6. To disconnect, press F11 again and click "Disconnect"
 
 ## Configuration
 
@@ -39,7 +42,7 @@ After first run, a config file is created at:
 |---------|---------|-------------|
 | DefaultPort | 6968 | Default server port |
 | LastServerAddress | (empty) | Last connected server (auto-saved) |
-| ConnectHotkey | F8 | Hotkey to open connect dialog |
+| ConnectHotkey | F11 | Hotkey to open connect dialog |
 
 ## Finding Servers
 

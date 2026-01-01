@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.0.44
+- **STATUS: WORKING!** Successfully connecting to dedicated servers!
+- Updated README with correct usage instructions
+- Main menu "Join Multiplayer" button now works
+- F11 hotkey works from anywhere
+- Connects from main menu without loading a save first
+
+## 1.0.43
+- **FIX**: Don't disable LoadingUI gameObject (broke save loading)
+- Now only hides visually with alpha=0 but keeps gameObject active
+- Creates dummy NetworkMessageRelay instance to prevent NRE in FlowManager
+- This should allow the loading process to complete naturally
+
+## 1.0.42
+- **FIX**: Force-hide loading screen by disabling the gameObject entirely
+- Sets CanvasGroup alpha to 0 (invisible)
+- Sets blocksRaycasts to false (clicks pass through)
+- Disables LoadingUI gameObject completely
+- This bypasses the "press any key" input requirement
+
+## 1.0.41
+- **FIX**: Bypass "Click to continue" entirely after forcing loading completion
+- Sets confirmedLoad = true to skip the click requirement
+- Sets _loaded = true to mark loading as complete
+- Ensures CanvasGroup is interactable (in case that was blocking clicks)
+- Should now go directly to game after 3 seconds without needing to click
+
+## 1.0.40
+- **FIX**: Restore Time.timeScale to 1 after forcing loading completion
+- Game sets timeScale=0 during loading, which also freezes input
+- Now properly restores timeScale so "Click to continue" works!
+
 ## 1.0.39
 - **FIX**: Use Time.unscaledDeltaTime instead of Time.deltaTime
 - Game sets timeScale=0 during loading, making deltaTime=0

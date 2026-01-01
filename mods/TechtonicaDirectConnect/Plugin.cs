@@ -337,6 +337,45 @@ namespace TechtonicaDirectConnect
                                 {
                                     onFinishMethod.Invoke(loadingUI, null);
                                     Log.LogInfo("[DirectConnect] Successfully called LoadingUI.OnFinishLoading()!");
+
+                                    // Also restore timeScale since loading may have paused the game
+                                    if (Time.timeScale == 0f)
+                                    {
+                                        Time.timeScale = 1f;
+                                        Log.LogInfo("[DirectConnect] Restored Time.timeScale to 1");
+                                    }
+
+                                    // Also set confirmedLoad = true to bypass "click to continue"
+                                    var confirmedLoadField = loadingUIType.GetField("confirmedLoad", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                    if (confirmedLoadField != null)
+                                    {
+                                        confirmedLoadField.SetValue(loadingUI, true);
+                                        Log.LogInfo("[DirectConnect] Set confirmedLoad = true");
+                                    }
+
+                                    // Ensure _loaded is set to true (reuse loadedFieldInfo from earlier check)
+                                    if (loadedFieldInfo != null)
+                                    {
+                                        loadedFieldInfo.SetValue(loadingUI, true);
+                                        Log.LogInfo("[DirectConnect] Set _loaded = true");
+                                    }
+
+                                    // Just hide visually but keep active so loading completes
+                                    var cgField = loadingUIType.GetField("cg", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                    if (cgField != null)
+                                    {
+                                        var cg = cgField.GetValue(loadingUI);
+                                        if (cg != null)
+                                        {
+                                            var cgType = cg.GetType();
+                                            cgType.GetProperty("alpha")?.SetValue(cg, 0f);  // Hide it
+                                            cgType.GetProperty("blocksRaycasts")?.SetValue(cg, false);  // Allow clicks through
+                                            Log.LogInfo("[DirectConnect] Set CanvasGroup alpha=0, hidden (but gameObject still active)");
+                                        }
+                                    }
+
+                                    // Create a dummy NetworkMessageRelay instance if needed to prevent NRE
+                                    EnsureNetworkMessageRelayExists();
                                 }
                                 catch (Exception ex)
                                 {
@@ -356,6 +395,60 @@ namespace TechtonicaDirectConnect
             {
                 // Always log errors now - they're critical for debugging
                 Log.LogError($"[DirectConnect] Loading monitor error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Creates a dummy NetworkMessageRelay instance if one doesn't exist.
+        /// This prevents NullReferenceException when FlowManager tries to call RequestCurrentSimTick.
+        /// </summary>
+        private void EnsureNetworkMessageRelayExists()
+        {
+            try
+            {
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Log.LogWarning("[DirectConnect] NetworkMessageRelay type not found");
+                    return;
+                }
+
+                // Check if instance already exists
+                var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (instanceField == null)
+                {
+                    // Try property
+                    var instanceProp = relayType.GetProperty("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    if (instanceProp != null)
+                    {
+                        var existing = instanceProp.GetValue(null);
+                        if (existing != null)
+                        {
+                            Log.LogInfo("[DirectConnect] NetworkMessageRelay.instance already exists");
+                            return;
+                        }
+                    }
+                    Log.LogWarning("[DirectConnect] Could not find NetworkMessageRelay.instance field/property");
+                    return;
+                }
+
+                var existingInstance = instanceField.GetValue(null);
+                if (existingInstance != null)
+                {
+                    Log.LogInfo("[DirectConnect] NetworkMessageRelay.instance already exists");
+                    return;
+                }
+
+                // Create a dummy instance - it's a MonoBehaviour so we need a GameObject
+                var dummyGO = new GameObject("DirectConnect_DummyNetworkMessageRelay");
+                DontDestroyOnLoad(dummyGO);
+                var dummyRelay = dummyGO.AddComponent(relayType);
+                instanceField.SetValue(null, dummyRelay);
+                Log.LogInfo("[DirectConnect] Created dummy NetworkMessageRelay instance");
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"[DirectConnect] Failed to create NetworkMessageRelay: {ex.Message}");
             }
         }
 
@@ -950,7 +1043,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.39";
+        public const string PLUGIN_VERSION = "1.0.44";
     }
 
     /// <summary>

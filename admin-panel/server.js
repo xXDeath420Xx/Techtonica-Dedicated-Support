@@ -15,12 +15,17 @@ const Database = require('better-sqlite3');
 const crypto = require('crypto');
 
 // Configuration
+const passport = require('passport');
+const DiscordStrategy = require('passport-discord').Strategy;
+
 const CONFIG = {
     gameDir: '/home/death/techtonica-server/game/Techtonica',
     winePrefix: '/home/death/techtonica-server/wine',
+    display: ':98',
     bepinexLog: '/home/death/techtonica-server/game/Techtonica/BepInEx/LogOutput.log',
     debugLog: '/home/death/techtonica-server/debug.log',
     gameLog: '/home/death/techtonica-server/game/Techtonica/game.log',
+    eventLog: '/home/death/techtonica-server/events.log',
     modConfig: '/home/death/techtonica-server/game/Techtonica/BepInEx/config/com.community.techtonicadedicatedserver.cfg',
     savesDir: '/home/death/techtonica-server/saves',
     backupsDir: '/home/death/techtonica-server/backups',
@@ -28,8 +33,18 @@ const CONFIG = {
     port: 6969,
     basePath: '/techtonica-admin',
     sslCert: '/etc/letsencrypt/live/certifriedmultitool.com/fullchain.pem',
-    sslKey: '/etc/letsencrypt/live/certifriedmultitool.com/privkey.pem'
+    sslKey: '/etc/letsencrypt/live/certifriedmultitool.com/privkey.pem',
+    // Discord OAuth2 (shared with CertiFriedUtility)
+    discord: {
+        clientId: '1409904443125665875',
+        clientSecret: 'hYOmKvMb9HTcbDQO825GF9LKAZwQf6fv',
+        callbackUrl: 'https://certifriedmultitool.com/techtonica-admin/auth/discord/callback',
+        scopes: ['identify']
+    }
 };
+
+// Track last processed event for webhook notifications
+let lastEventTimestamp = new Date().toISOString();
 
 // Ensure directories exist
 ['data', 'public/css', 'public/js'].forEach(dir => {
@@ -43,8 +58,63 @@ if (!fs.existsSync(CONFIG.backupsDir)) {
     fs.mkdirSync(CONFIG.backupsDir, { recursive: true });
 }
 
+// Database backup directory
+const DB_BACKUP_DIR = path.join(__dirname, 'data', 'backups');
+if (!fs.existsSync(DB_BACKUP_DIR)) {
+    fs.mkdirSync(DB_BACKUP_DIR, { recursive: true });
+}
+
 // Initialize database
 const db = new Database(CONFIG.dbFile);
+
+// Function to create database backup
+function backupDatabase(reason = 'scheduled') {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(DB_BACKUP_DIR, `admin-${timestamp}-${reason}.db`);
+    try {
+        // Use SQLite backup API with file path string
+        db.backup(backupPath).then(() => {
+            console.log(`Database backup created: ${backupPath}`);
+            // Clean old backups - keep last 20
+            const backups = fs.readdirSync(DB_BACKUP_DIR)
+                .filter(f => f.endsWith('.db'))
+                .map(f => ({ name: f, time: fs.statSync(path.join(DB_BACKUP_DIR, f)).mtime }))
+                .sort((a, b) => b.time - a.time);
+            if (backups.length > 20) {
+                backups.slice(20).forEach(b => {
+                    fs.unlinkSync(path.join(DB_BACKUP_DIR, b.name));
+                    console.log(`Deleted old backup: ${b.name}`);
+                });
+            }
+        }).catch(err => {
+            console.error('Database backup failed:', err);
+        });
+    } catch (err) {
+        console.error('Database backup error:', err);
+        // Fallback: simple file copy
+        try {
+            fs.copyFileSync(CONFIG.dbFile, backupPath);
+            console.log(`Database backup (copy) created: ${backupPath}`);
+        } catch (copyErr) {
+            console.error('Database copy backup failed:', copyErr);
+        }
+    }
+}
+
+// Create startup backup if database has content
+setTimeout(() => {
+    try {
+        const stats = fs.statSync(CONFIG.dbFile);
+        if (stats.size > 0) {
+            backupDatabase('startup');
+        }
+    } catch (e) { /* ignore */ }
+}, 2000);
+
+// Schedule periodic backups every hour
+setInterval(() => {
+    backupDatabase('hourly');
+}, 60 * 60 * 1000);
 
 // Create tables
 db.exec(`
@@ -192,6 +262,9 @@ if (userCount.count === 0) {
 // Initialize Express
 const app = express();
 
+// Trust reverse proxy for accurate client IPs (reads X-Forwarded-For header)
+app.set('trust proxy', true);
+
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -204,16 +277,42 @@ app.use((req, res, next) => {
     next();
 });
 
+// Fixed session secret (persists across restarts)
+const SESSION_SECRET = process.env.SESSION_SECRET || 'techtonica-admin-secret-2024-fixed';
+
+// Temporary store for Discord linking (survives OAuth redirect)
+const pendingDiscordLinks = new Map();
+
 // Session configuration
 app.use(session({
-    secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-    resave: false,
-    saveUninitialized: false,
+    secret: SESSION_SECRET,
+    resave: true,
+    saveUninitialized: true,
     cookie: {
         secure: false,
         httpOnly: true,
-        maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        sameSite: 'lax'
     }
+}));
+
+// Initialize Passport for Discord OAuth
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Passport serialization
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
+
+// Discord OAuth2 Strategy
+passport.use(new DiscordStrategy({
+    clientID: CONFIG.discord.clientId,
+    clientSecret: CONFIG.discord.clientSecret,
+    callbackURL: CONFIG.discord.callbackUrl,
+    scope: CONFIG.discord.scopes
+}, (accessToken, refreshToken, profile, done) => {
+    // Return Discord profile for login processing
+    return done(null, profile);
 }));
 
 // Static files
@@ -265,7 +364,8 @@ function auditLog(userId, action, details, ipAddress) {
 // Server status tracking
 async function checkServerRunning() {
     return new Promise((resolve) => {
-        exec('ps -eo pid,etimes,args | grep "Techtonica.exe.*-batchmode" | grep -v grep | head -1', (err, stdout) => {
+        // Check for Techtonica.exe process (excluding defunct/zombie processes)
+        exec('ps -eo pid,etimes,args | grep "Techtonica.exe" | grep -v grep | grep -v defunct | head -1', (err, stdout) => {
             const line = stdout.trim();
             if (!line) {
                 resolve({ running: false, pid: null, uptime: 0 });
@@ -298,6 +398,59 @@ async function getSystemStats() {
                 memory: { total: totalMem, used: usedMem, percent: totalMem ? (usedMem / totalMem * 100).toFixed(1) : 0 },
                 cpu: { load1, load5, load15 },
                 disk: { total: totalDisk, used: usedDisk, percent: totalDisk ? (usedDisk / totalDisk * 100).toFixed(1) : 0 }
+            });
+        });
+    });
+}
+
+// Read game events from the mod's event log file
+function readGameEvents(sinceTimestamp = null) {
+    const events = [];
+    try {
+        if (!fs.existsSync(CONFIG.eventLog)) return events;
+
+        const content = fs.readFileSync(CONFIG.eventLog, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim());
+
+        for (const line of lines) {
+            try {
+                const event = JSON.parse(line);
+                if (sinceTimestamp && new Date(event.timestamp) <= new Date(sinceTimestamp)) {
+                    continue;
+                }
+                events.push(event);
+            } catch (e) { /* Skip invalid lines */ }
+        }
+    } catch (err) {
+        // Event log doesn't exist yet - that's fine
+    }
+    return events;
+}
+
+// Get process-specific metrics for Techtonica
+async function getProcessMetrics() {
+    return new Promise((resolve) => {
+        exec('ps -eo pid,%cpu,%mem,rss,args | grep "Techtonica.exe" | grep -v grep | head -1', (err, stdout) => {
+            const line = stdout.trim();
+            if (!line) {
+                resolve({ cpu: 0, memory: 0, memoryMB: 0, totalMemoryMB: 0 });
+                return;
+            }
+            const parts = line.trim().split(/\s+/);
+            const rawCpu = parseFloat(parts[1]) || 0;
+            const memPercent = parseFloat(parts[2]) || 0;
+            const rss = parseInt(parts[3]) || 0; // RSS in KB
+            const memoryMB = rss / 1024;
+
+            // Get CPU core count and total memory
+            exec('nproc', (err2, stdout2) => {
+                const cpuCores = parseInt(stdout2.trim()) || 1;
+                const cpu = rawCpu / cpuCores;  // Normalize to 0-100%
+
+                exec('free -m | grep Mem | awk \'{print $2}\'', (err3, stdout3) => {
+                    const totalMemoryMB = parseInt(stdout3.trim()) || 0;
+                    resolve({ cpu, memory: memPercent, memoryMB, totalMemoryMB });
+                });
             });
         });
     });
@@ -374,6 +527,125 @@ app.get('/login', (req, res) => {
         return res.redirect(CONFIG.basePath + '/');
     }
     res.sendFile(path.join(__dirname, 'public/login.html'));
+});
+
+// Discord OAuth Login - initiate
+app.get('/auth/discord', passport.authenticate('discord'));
+
+// Discord OAuth Callback - handle both login and linking
+app.get('/auth/discord/callback', async (req, res) => {
+    const { code, state } = req.query;
+
+    if (!code) {
+        return res.redirect(CONFIG.basePath + '/login?error=discord_failed');
+    }
+
+    try {
+        // Exchange code for token
+        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: CONFIG.discord.clientId,
+                client_secret: CONFIG.discord.clientSecret,
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: CONFIG.discord.callbackUrl
+            })
+        });
+
+        if (!tokenRes.ok) {
+            console.error('[Discord Callback] Token exchange failed:', await tokenRes.text());
+            return res.redirect(CONFIG.basePath + '/login?error=discord_failed');
+        }
+
+        const tokens = await tokenRes.json();
+
+        // Get user info
+        const userRes = await fetch('https://discord.com/api/users/@me', {
+            headers: { 'Authorization': `Bearer ${tokens.access_token}` }
+        });
+
+        if (!userRes.ok) {
+            console.error('[Discord Callback] User fetch failed');
+            return res.redirect(CONFIG.basePath + '/login?error=discord_failed');
+        }
+
+        const discordUser = await userRes.json();
+        const discordId = discordUser.id;
+        const discordUsername = discordUser.global_name || discordUser.username;
+
+        console.log('[Discord Callback] Got user:', discordUsername, 'state:', state);
+
+        // Check if this is a linking operation (state starts with "link:")
+        if (state && state.startsWith('link:')) {
+            const linkToken = state.substring(5);
+            const pendingLink = pendingDiscordLinks.get(linkToken);
+            console.log('[Discord Callback] Link token:', linkToken, 'found:', !!pendingLink);
+
+            if (pendingLink) {
+                const linkingUserId = pendingLink.userId;
+                pendingDiscordLinks.delete(linkToken);
+
+                // Check if Discord is already linked to another user
+                const existing = db.prepare('SELECT id, username FROM users WHERE discord_id = ? AND id != ?')
+                    .get(discordId, linkingUserId);
+                if (existing) {
+                    return res.redirect(CONFIG.basePath + '/?error=discord_already_linked');
+                }
+
+                // Link Discord to current user
+                db.prepare('UPDATE users SET discord_id = ?, discord_username = ? WHERE id = ?')
+                    .run(discordId, discordUsername, linkingUserId);
+                auditLog(linkingUserId, 'discord_link', `Linked Discord account: ${discordUsername} (${discordId})`, req.ip);
+
+                // Restore session
+                req.session.userId = linkingUserId;
+                return res.redirect(CONFIG.basePath + '/?success=discord_linked');
+            } else {
+                console.log('[Discord Callback] Link token not found in pending links');
+                return res.redirect(CONFIG.basePath + '/login?error=link_expired');
+            }
+        }
+
+        // Normal login flow - find user with this Discord ID
+        const user = db.prepare('SELECT * FROM users WHERE discord_id = ? AND is_active = 1').get(discordId);
+
+        if (user) {
+            // User found - log them in
+            db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP, discord_username = ? WHERE id = ?')
+                .run(discordUsername, user.id);
+            req.session.userId = user.id;
+            auditLog(user.id, 'discord_login', `User logged in via Discord (${discordUsername})`, req.ip);
+            return res.redirect(CONFIG.basePath + '/');
+        } else {
+            // No user with this Discord ID - redirect to login with error
+            auditLog(null, 'discord_login_failed', `No account linked to Discord ID: ${discordId} (${discordUsername})`, req.ip);
+            return res.redirect(CONFIG.basePath + '/login?error=no_linked_account&discord_id=' + discordId + '&discord_username=' + encodeURIComponent(discordUsername));
+        }
+    } catch (err) {
+        console.error('[Discord Callback] Error:', err);
+        return res.redirect(CONFIG.basePath + '/login?error=discord_failed');
+    }
+});
+
+// Discord OAuth Link (for logged-in users to link their account)
+app.get('/auth/discord/link', requireAuth, (req, res) => {
+    console.log('[Discord Link] User', req.session.userId, 'starting link flow');
+    // Store linking info in memory map
+    const linkToken = crypto.randomBytes(16).toString('hex');
+    pendingDiscordLinks.set(linkToken, {
+        userId: req.session.userId,
+        timestamp: Date.now()
+    });
+    // Clean old entries (older than 10 minutes)
+    for (const [key, value] of pendingDiscordLinks.entries()) {
+        if (Date.now() - value.timestamp > 600000) pendingDiscordLinks.delete(key);
+    }
+    console.log('[Discord Link] Created token:', linkToken, 'for user:', req.session.userId);
+    // Redirect to Discord OAuth with state parameter containing the link token
+    const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${CONFIG.discord.clientId}&redirect_uri=${encodeURIComponent(CONFIG.discord.callbackUrl)}&response_type=code&scope=${CONFIG.discord.scopes.join('%20')}&state=link:${linkToken}`;
+    res.redirect(authUrl);
 });
 
 // Register page (invite only)
@@ -461,16 +733,18 @@ app.post('/api/auth/logout', (req, res) => {
 // API: Get current user
 app.get('/api/auth/me', requireAuth, (req, res) => {
     res.json({
-        id: req.user.id,
-        username: req.user.username,
-        email: req.user.email,
-        role: req.user.role,
-        roleInfo: ROLES[req.user.role],
-        permissions: Object.keys(PERMISSIONS).filter(p => hasPermission(req.user.role, p)),
-        createdAt: req.user.created_at,
-        lastLogin: req.user.last_login,
-        discordId: req.user.discord_id,
-        discordUsername: req.user.discord_username
+        user: {
+            id: req.user.id,
+            username: req.user.username,
+            email: req.user.email,
+            role: req.user.role,
+            roleInfo: ROLES[req.user.role],
+            permissions: Object.keys(PERMISSIONS).filter(p => hasPermission(req.user.role, p)),
+            createdAt: req.user.created_at,
+            lastLogin: req.user.last_login,
+            discordId: req.user.discord_id,
+            discordUsername: req.user.discord_username
+        }
     });
 });
 
@@ -490,6 +764,70 @@ app.post('/api/auth/change-password', requireAuth, (req, res) => {
     db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hashedPassword, req.user.id);
     auditLog(req.user.id, 'password_change', 'User changed their password', req.ip);
     res.json({ success: true });
+});
+
+// API: Update own profile (username, email)
+app.post('/api/auth/update-profile', requireAuth, (req, res) => {
+    const { username, email } = req.body;
+
+    if (!username || username.trim().length === 0) {
+        return res.status(400).json({ error: 'Username is required' });
+    }
+
+    const trimmedUsername = username.trim();
+
+    // Validate username format
+    if (!/^[a-zA-Z0-9_-]{3,32}$/.test(trimmedUsername)) {
+        return res.status(400).json({ error: 'Username must be 3-32 characters and contain only letters, numbers, underscores, and hyphens' });
+    }
+
+    // Check if username is already taken by another user
+    if (trimmedUsername !== req.user.username) {
+        const existing = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(trimmedUsername, req.user.id);
+        if (existing) {
+            return res.status(400).json({ error: 'Username is already taken' });
+        }
+    }
+
+    const updates = [];
+    const params = [];
+
+    // Update username
+    if (trimmedUsername !== req.user.username) {
+        updates.push('username = ?');
+        params.push(trimmedUsername);
+    }
+
+    // Update email (can be null/empty)
+    const trimmedEmail = email ? email.trim() : null;
+    if (trimmedEmail !== req.user.email) {
+        updates.push('email = ?');
+        params.push(trimmedEmail);
+    }
+
+    if (updates.length === 0) {
+        return res.json({ success: true, message: 'No changes made' });
+    }
+
+    params.push(req.user.id);
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+    const changes = [];
+    if (trimmedUsername !== req.user.username) changes.push(`username: ${req.user.username} -> ${trimmedUsername}`);
+    if (trimmedEmail !== req.user.email) changes.push(`email updated`);
+
+    auditLog(req.user.id, 'profile_update', `Profile updated: ${changes.join(', ')}`, req.ip);
+
+    res.json({
+        success: true,
+        message: 'Profile updated successfully',
+        user: {
+            id: req.user.id,
+            username: trimmedUsername,
+            email: trimmedEmail,
+            role: req.user.role
+        }
+    });
 });
 
 // API: Link Discord account
@@ -554,7 +892,7 @@ app.get('/api/server/status', requireAuth, async (req, res) => {
             pid: serverStatus.pid,
             uptime: serverStatus.uptime,
             uptimeFormatted: formatUptime(serverStatus.uptime),
-            address: '51.81.155.59:6968'
+            address: 'techtonica.certifriedmultitool.com:6968'
         },
         system: {
             memory: { ...systemStats.memory, totalFormatted: formatBytes(systemStats.memory.total), usedFormatted: formatBytes(systemStats.memory.used) },
@@ -565,6 +903,109 @@ app.get('/api/server/status', requireAuth, async (req, res) => {
     });
 });
 
+// API: Simple status endpoint for dashboard
+app.get('/api/status', requireAuth, async (req, res) => {
+    const serverStatus = await checkServerRunning();
+    const config = parseConfig();
+
+    res.json({
+        status: serverStatus.running ? 'running' : 'stopped',
+        uptime: serverStatus.uptime,
+        serverAddress: 'techtonica.certifriedmultitool.com:6968',
+        config
+    });
+});
+
+// API: Process metrics for performance charts
+app.get('/api/metrics', requireAuth, async (req, res) => {
+    const metrics = await getProcessMetrics();
+    res.json(metrics);
+});
+
+// API: Get players (parse from game events)
+app.get('/api/players', requireAuth, (req, res) => {
+    const players = [];
+    const playerMap = new Map(); // connectionId -> player info
+
+    try {
+        // Read all events and track connect/disconnect
+        const events = readGameEvents();
+
+        for (const event of events) {
+            if (event.type === 'player_connect') {
+                playerMap.set(event.connectionId, {
+                    connectionId: event.connectionId,
+                    name: `Player_${event.connectionId}`,
+                    address: event.address,
+                    connectedAt: event.timestamp
+                });
+            } else if (event.type === 'player_identified') {
+                const player = playerMap.get(event.connectionId);
+                if (player) {
+                    player.name = event.name;
+                }
+            } else if (event.type === 'player_disconnect') {
+                playerMap.delete(event.connectionId);
+            } else if (event.type === 'server_stop') {
+                // Clear all players on server stop
+                playerMap.clear();
+            }
+        }
+
+        // Convert to array
+        for (const [id, player] of playerMap) {
+            const connectedAt = new Date(player.connectedAt);
+            const now = new Date();
+            const duration = Math.floor((now - connectedAt) / 1000);
+            const minutes = Math.floor(duration / 60);
+            const seconds = duration % 60;
+
+            players.push({
+                ...player,
+                connectedTime: `${minutes}m ${seconds}s`
+            });
+        }
+
+        res.json({ players, count: players.length });
+    } catch (err) {
+        console.error('Error getting players:', err);
+        res.json({ players: [], count: 0 });
+    }
+});
+
+// API: Simple logs endpoint for dashboard
+app.get('/api/logs', requireAuth, (req, res) => {
+    const type = req.query.type || 'bepinex';
+    const lines = parseInt(req.query.lines) || 200;
+
+    let logFile;
+    switch(type) {
+        case 'debug': logFile = CONFIG.debugLog; break;
+        case 'game': logFile = CONFIG.gameLog; break;
+        case 'bepinex':
+        default: logFile = CONFIG.bepinexLog; break;
+    }
+
+    exec(`tail -n ${lines} "${logFile}" 2>/dev/null || echo "Log file not found"`, (err, stdout) => {
+        const logLines = stdout.split('\n').filter(l => l.trim());
+        res.json({ logs: logLines });
+    });
+});
+
+// API: Simple config save for dashboard
+app.post('/api/config', requireAuth, (req, res) => {
+    const config = req.body;
+    if (!config) {
+        return res.status(400).json({ error: 'Config required' });
+    }
+    if (saveModConfig(config)) {
+        auditLog(req.user.id, 'config_update', 'Server configuration updated', req.ip);
+        res.json({ success: true });
+    } else {
+        res.status(500).json({ error: 'Failed to save config' });
+    }
+});
+
 // API: Start server
 app.post('/api/server/start', requireAuth, requirePermission('server.start'), async (req, res) => {
     const serverStatus = await checkServerRunning();
@@ -573,20 +1014,33 @@ app.post('/api/server/start', requireAuth, requirePermission('server.start'), as
         return res.status(400).json({ error: 'Server is already running' });
     }
 
+    // Get save path from request or use configured default
+    const { savePath } = req.body || {};
+
     const config = parseConfig();
     config['Server'] = config['Server'] || {};
     config['Server']['AutoStartServer'] = 'true';
     config['Server']['HeadlessMode'] = 'true';
+    config['Server']['AutoLoadSlot'] = '-1';
     config['General'] = config['General'] || {};
     config['General']['EnableDirectConnect'] = 'true';
+
+    // Set save path if provided
+    if (savePath) {
+        config['Server']['AutoLoadSave'] = savePath;
+    }
+
     saveModConfig(config);
+
+    // Clear debug log for fresh start
+    try { fs.writeFileSync(CONFIG.debugLog, ''); } catch(e) {}
 
     const startScript = `
         cd ${CONFIG.gameDir} &&
         WINEPREFIX=${CONFIG.winePrefix} \\
         WINEDLLOVERRIDES="winhttp=n,b" \\
-        DISPLAY=:99 \\
-        wine Techtonica.exe -batchmode -nographics > ${CONFIG.gameLog} 2>&1 &
+        DISPLAY=${CONFIG.display} \\
+        wine Techtonica.exe -batchmode -logfile ${CONFIG.gameLog} > /home/death/techtonica-server/wine-output.log 2>&1 &
     `;
 
     exec(startScript, (err) => {
@@ -594,11 +1048,35 @@ app.post('/api/server/start', requireAuth, requirePermission('server.start'), as
             auditLog(req.user.id, 'server_start_failed', err.message, req.ip);
             return res.status(500).json({ error: 'Failed to start server' });
         }
-        auditLog(req.user.id, 'server_start', 'Server started', req.ip);
-        triggerWebhook('server_start', { user: req.user.username });
-        res.json({ success: true, message: 'Server starting...' });
+        auditLog(req.user.id, 'server_start', `Server started${savePath ? ' with save: ' + savePath : ''}`, req.ip);
+        const config = parseConfig();
+        const serverAddress = config['Server']?.PublicAddress || 'certifriedmultitool.com:6968';
+        const webhookData = { user: req.user.username, 'Connect Address': serverAddress };
+        if (savePath) webhookData.savePath = savePath;
+        triggerWebhook('server_start', webhookData);
+        res.json({ success: true, message: 'Server starting... Auto-load may take a few minutes.' });
     });
 });
+
+// Helper: Force kill all server processes
+async function killServerProcesses() {
+    return new Promise((resolve) => {
+        // Kill all Techtonica.exe processes forcefully
+        exec(`pkill -9 -f "Techtonica.exe" 2>/dev/null; sleep 1; pkill -9 -f "wineserver" 2>/dev/null`, (err) => {
+            // Wait for port to be released
+            const checkPort = () => {
+                exec('ss -ulnp | grep 6968', (err, stdout) => {
+                    if (!stdout.trim()) {
+                        resolve(true);
+                    } else {
+                        setTimeout(checkPort, 500);
+                    }
+                });
+            };
+            setTimeout(checkPort, 1000);
+        });
+    });
+}
 
 // API: Stop server
 app.post('/api/server/stop', requireAuth, requirePermission('server.stop'), async (req, res) => {
@@ -608,15 +1086,15 @@ app.post('/api/server/stop', requireAuth, requirePermission('server.stop'), asyn
         return res.status(400).json({ error: 'Server is not running' });
     }
 
-    exec(`kill ${serverStatus.pid}`, (err) => {
-        if (err) {
-            auditLog(req.user.id, 'server_stop_failed', err.message, req.ip);
-            return res.status(500).json({ error: 'Failed to stop server' });
-        }
+    try {
+        await killServerProcesses();
         auditLog(req.user.id, 'server_stop', 'Server stopped', req.ip);
         triggerWebhook('server_stop', { user: req.user.username });
         res.json({ success: true, message: 'Server stopped' });
-    });
+    } catch (err) {
+        auditLog(req.user.id, 'server_stop_failed', err.message, req.ip);
+        return res.status(500).json({ error: 'Failed to stop server' });
+    }
 });
 
 // API: Restart server
@@ -628,14 +1106,20 @@ app.post('/api/server/restart', requireAuth, requirePermission('server.restart')
         config['Server'] = config['Server'] || {};
         config['Server']['AutoStartServer'] = 'true';
         config['Server']['HeadlessMode'] = 'true';
+        config['Server']['AutoLoadSlot'] = '-1';
+        config['General'] = config['General'] || {};
+        config['General']['EnableDirectConnect'] = 'true';
         saveModConfig(config);
+
+        // Clear debug log for fresh start
+        try { fs.writeFileSync(CONFIG.debugLog, ''); } catch(e) {}
 
         const startScript = `
             cd ${CONFIG.gameDir} &&
             WINEPREFIX=${CONFIG.winePrefix} \\
             WINEDLLOVERRIDES="winhttp=n,b" \\
-            DISPLAY=:99 \\
-            wine Techtonica.exe -batchmode -nographics > ${CONFIG.gameLog} 2>&1 &
+            DISPLAY=${CONFIG.display} \\
+            wine Techtonica.exe -batchmode -logfile ${CONFIG.gameLog} > /home/death/techtonica-server/wine-output.log 2>&1 &
         `;
 
         exec(startScript, (err) => {
@@ -643,19 +1127,20 @@ app.post('/api/server/restart', requireAuth, requirePermission('server.restart')
                 return res.status(500).json({ error: 'Failed to start server' });
             }
             auditLog(req.user.id, 'server_restart', 'Server restarted', req.ip);
-            triggerWebhook('server_restart', { user: req.user.username });
-            res.json({ success: true, message: 'Server restarting...' });
+            const config = parseConfig();
+            const serverAddress = config['Server']?.PublicAddress || 'certifriedmultitool.com:6968';
+            triggerWebhook('server_restart', { user: req.user.username, 'Connect Address': serverAddress });
+            res.json({ success: true, message: 'Server restarting... Auto-load may take a few minutes.' });
         });
     };
 
     if (serverStatus.running) {
-        exec(`kill ${serverStatus.pid}`, async (err) => {
-            if (err) {
-                return res.status(500).json({ error: 'Failed to stop server' });
-            }
-            await new Promise(resolve => setTimeout(resolve, 3000));
+        try {
+            await killServerProcesses();
             startServer();
-        });
+        } catch (err) {
+            return res.status(500).json({ error: 'Failed to stop server for restart' });
+        }
     } else {
         startServer();
     }
@@ -790,7 +1275,8 @@ app.post('/api/users', requireAuth, requirePermission('users.create'), (req, res
         return res.status(400).json({ error: 'Username and password required' });
     }
 
-    if (ROLES[role]?.level >= ROLES[req.user.role]?.level) {
+    // Owners can create any role, others can only create lower roles
+    if (req.user.role !== 'owner' && ROLES[role]?.level >= ROLES[req.user.role]?.level) {
         return res.status(403).json({ error: 'Cannot create user with equal or higher role' });
     }
 
@@ -816,11 +1302,13 @@ app.put('/api/users/:id', requireAuth, requirePermission('users.edit'), (req, re
         return res.status(404).json({ error: 'User not found' });
     }
 
-    if (targetUser.id !== req.user.id && ROLES[targetUser.role]?.level >= ROLES[req.user.role]?.level) {
+    // Owners can edit anyone, others can only edit users with lower role level
+    if (req.user.role !== 'owner' && targetUser.id !== req.user.id && ROLES[targetUser.role]?.level >= ROLES[req.user.role]?.level) {
         return res.status(403).json({ error: 'Cannot edit user with equal or higher role' });
     }
 
-    if (role && ROLES[role]?.level >= ROLES[req.user.role]?.level) {
+    // Owners can promote to any role, others can only promote to lower role levels
+    if (role && req.user.role !== 'owner' && ROLES[role]?.level >= ROLES[req.user.role]?.level) {
         return res.status(403).json({ error: 'Cannot promote user to equal or higher role' });
     }
 
@@ -908,7 +1396,19 @@ app.delete('/api/invites/:id', requireAuth, requirePermission('users.create'), (
     res.json({ success: true });
 });
 
-// API: Get audit log
+// API: Get recent activity (for dashboard - accessible by all authenticated users)
+app.get('/api/activity', requireAuth, (req, res) => {
+    const limit = parseInt(req.query.limit) || 10;
+    const logs = db.prepare(`
+        SELECT a.action, a.details, a.created_at, a.ip_address, u.username
+        FROM audit_log a LEFT JOIN users u ON a.user_id = u.id
+        WHERE a.action IN ('server_start', 'server_stop', 'server_restart', 'login', 'config_update', 'backup_create')
+        ORDER BY a.created_at DESC LIMIT ?
+    `).all(limit);
+    res.json({ logs });
+});
+
+// API: Get audit log (full - requires permission)
 app.get('/api/audit', requireAuth, requirePermission('audit.view'), (req, res) => {
     const limit = parseInt(req.query.limit) || 100;
     const offset = parseInt(req.query.offset) || 0;
@@ -952,8 +1452,12 @@ app.delete('/api/webhooks/:id', requireAuth, requirePermission('webhooks.manage'
 app.get('/api/saves', requireAuth, (req, res) => {
     const wineSavesDir = path.join(CONFIG.winePrefix, 'drive_c/users/death/AppData/LocalLow/Fire Hose Games/Techtonica/saves');
 
+    // Get current active save from config
+    const config = parseConfig();
+    const activeSave = config['Server']?.AutoLoadSave || '';
+
     if (!fs.existsSync(wineSavesDir)) {
-        return res.json({ saves: [] });
+        return res.json({ saves: [], activeSave });
     }
 
     const saves = [];
@@ -968,9 +1472,11 @@ app.get('/api/saves', requireAuth, (req, res) => {
                 } else if (file.endsWith('.dat')) {
                     saves.push({
                         name: relPath,
+                        path: fullPath,
                         size: stat.size,
                         sizeFormatted: formatBytes(stat.size),
-                        modified: stat.mtime
+                        modified: stat.mtime,
+                        isActive: fullPath === activeSave
                     });
                 }
             });
@@ -979,7 +1485,128 @@ app.get('/api/saves', requireAuth, (req, res) => {
 
     walkSync(wineSavesDir);
     saves.sort((a, b) => new Date(b.modified) - new Date(a.modified));
-    res.json({ saves });
+    res.json({ saves, activeSave });
+});
+
+// API: Set active save file
+app.post('/api/saves/set-active', requireAuth, requirePermission('server.config'), (req, res) => {
+    const { savePath } = req.body;
+    if (!savePath) {
+        return res.status(400).json({ error: 'Save path required' });
+    }
+
+    // Verify save file exists
+    if (!fs.existsSync(savePath)) {
+        return res.status(404).json({ error: 'Save file not found' });
+    }
+
+    const config = parseConfig();
+    config['Server'] = config['Server'] || {};
+    config['Server']['AutoLoadSave'] = savePath;
+
+    if (saveModConfig(config)) {
+        auditLog(req.user.id, 'save_set_active', `Set active save: ${path.basename(savePath)}`, req.ip);
+        res.json({ success: true, message: 'Active save updated' });
+    } else {
+        res.status(500).json({ error: 'Failed to update config' });
+    }
+});
+
+// API: Upload save file
+app.post('/api/saves/upload', requireAuth, requirePermission('server.config'), (req, res) => {
+    const wineSavesDir = path.join(CONFIG.winePrefix, 'drive_c/users/death/AppData/LocalLow/Fire Hose Games/Techtonica/saves');
+
+    // Ensure saves directory exists
+    if (!fs.existsSync(wineSavesDir)) {
+        fs.mkdirSync(wineSavesDir, { recursive: true });
+    }
+
+    // Handle multipart form data manually (simple implementation)
+    let body = Buffer.alloc(0);
+
+    req.on('data', chunk => {
+        body = Buffer.concat([body, chunk]);
+    });
+
+    req.on('end', () => {
+        try {
+            const contentType = req.headers['content-type'] || '';
+
+            if (!contentType.includes('multipart/form-data')) {
+                return res.status(400).json({ error: 'Must be multipart/form-data' });
+            }
+
+            // Extract boundary
+            const boundaryMatch = contentType.match(/boundary=(.+)$/);
+            if (!boundaryMatch) {
+                return res.status(400).json({ error: 'No boundary found' });
+            }
+            const boundary = boundaryMatch[1];
+
+            // Parse multipart data
+            const parts = body.toString('binary').split('--' + boundary);
+
+            for (const part of parts) {
+                if (part.includes('filename=')) {
+                    // Extract filename
+                    const filenameMatch = part.match(/filename="([^"]+)"/);
+                    if (!filenameMatch) continue;
+
+                    let filename = filenameMatch[1];
+
+                    // Sanitize filename
+                    filename = path.basename(filename).replace(/[^a-zA-Z0-9_.-]/g, '_');
+                    if (!filename.endsWith('.dat')) {
+                        filename += '.dat';
+                    }
+
+                    // Extract file content (after double CRLF)
+                    const contentStart = part.indexOf('\r\n\r\n');
+                    if (contentStart === -1) continue;
+
+                    let fileContent = part.substring(contentStart + 4);
+                    // Remove trailing boundary markers
+                    fileContent = fileContent.replace(/\r\n--$/, '').replace(/--\r\n$/, '').replace(/\r\n$/, '');
+
+                    // Write file
+                    const savePath = path.join(wineSavesDir, filename);
+                    fs.writeFileSync(savePath, fileContent, 'binary');
+
+                    auditLog(req.user.id, 'save_upload', `Uploaded save: ${filename}`, req.ip);
+                    return res.json({ success: true, message: `Save uploaded: ${filename}`, path: savePath });
+                }
+            }
+
+            res.status(400).json({ error: 'No file found in upload' });
+        } catch (err) {
+            console.error('Upload error:', err);
+            res.status(500).json({ error: 'Upload failed: ' + err.message });
+        }
+    });
+});
+
+// API: Delete save file
+app.delete('/api/saves/:filename', requireAuth, requirePermission('server.config'), (req, res) => {
+    const wineSavesDir = path.join(CONFIG.winePrefix, 'drive_c/users/death/AppData/LocalLow/Fire Hose Games/Techtonica/saves');
+    const filename = decodeURIComponent(req.params.filename);
+    const savePath = path.join(wineSavesDir, filename);
+
+    // Security check - ensure path is within saves directory
+    if (!savePath.startsWith(wineSavesDir)) {
+        return res.status(403).json({ error: 'Invalid path' });
+    }
+
+    if (!fs.existsSync(savePath)) {
+        return res.status(404).json({ error: 'Save file not found' });
+    }
+
+    try {
+        fs.unlinkSync(savePath);
+        auditLog(req.user.id, 'save_delete', `Deleted save: ${filename}`, req.ip);
+        res.json({ success: true, message: 'Save deleted' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete save' });
+    }
 });
 
 // Webhook trigger function with rich Discord embeds
@@ -1017,6 +1644,21 @@ async function triggerWebhook(event, data) {
             title: '👋 Player Left',
             color: 0xf59e0b,  // Amber
             description: 'A player has left the server.'
+        },
+        player_connect: {
+            title: '🔌 Player Connected',
+            color: 0x22c55e,  // Green
+            description: 'A player has connected to the server.'
+        },
+        player_disconnect: {
+            title: '🔌 Player Disconnected',
+            color: 0xf59e0b,  // Amber
+            description: 'A player has disconnected from the server.'
+        },
+        player_identified: {
+            title: '👋 Player Joined',
+            color: 0x22c55e,  // Green
+            description: 'A player has joined the game world.'
         },
         default: {
             title: '📢 Server Event',
@@ -1141,12 +1783,66 @@ io.on('connection', (socket) => {
                 disk: { ...systemStats.disk, totalFormatted: formatBytes(systemStats.disk.total), usedFormatted: formatBytes(systemStats.disk.used) }
             }
         });
-    }, 5000);
+    }, 30000); // Every 30 seconds instead of 5
 
     socket.on('disconnect', () => {
         console.log('Client disconnected');
         clearInterval(statusInterval);
     });
+});
+
+// Process new game events and trigger webhooks
+function processGameEvents() {
+    const events = readGameEvents(lastEventTimestamp);
+
+    for (const event of events) {
+        // Update last timestamp
+        if (new Date(event.timestamp) > new Date(lastEventTimestamp)) {
+            lastEventTimestamp = event.timestamp;
+        }
+
+        // Map game event types to webhook events
+        const eventMap = {
+            'server_start': 'server_start',
+            'server_stop': 'server_stop',
+            'player_connect': 'player_connect',
+            'player_disconnect': 'player_disconnect',
+            'player_identified': 'player_identified'
+        };
+
+        const webhookEvent = eventMap[event.type];
+        if (webhookEvent) {
+            // Build data object from event
+            const data = {
+                message: event.message,
+                ...event
+            };
+            delete data.timestamp;
+            delete data.type;
+
+            triggerWebhook(webhookEvent, data);
+        }
+
+        // Emit to connected Socket.IO clients
+        io.emit('gameEvent', event);
+    }
+}
+
+// Start event watcher (check every 5 seconds)
+setInterval(processGameEvents, 5000);
+
+// API: Get game events
+app.get('/api/events', requireAuth, (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const since = req.query.since || null;
+
+    let events = readGameEvents(since);
+
+    // Sort by newest first and limit
+    events.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    events = events.slice(0, limit);
+
+    res.json({ events });
 });
 
 server.listen(CONFIG.port, '0.0.0.0', () => {

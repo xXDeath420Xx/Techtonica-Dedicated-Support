@@ -1,5 +1,7 @@
 # Techtonica Dedicated Server - Linux Installation
 
+**Status: WORKING!** - Successfully tested January 2026
+
 Run a 24/7 Techtonica dedicated server on Linux using Wine.
 
 ## Quick Start (Automated Installation)
