@@ -313,7 +313,14 @@ namespace TechtonicaDirectConnect
                     }
 
                     // ALWAYS increment timer when isActive (moved outside else block)
+                    float beforeIncrement = _loadingStuckTimer;
                     _loadingStuckTimer += Time.deltaTime;
+
+                    // Debug: log increment occasionally
+                    if (_monitorCheckCount % 120 == 0)
+                    {
+                        Log.LogInfo($"[DirectConnect] Timer increment: before={beforeIncrement:F4}, deltaTime={Time.deltaTime:F4}, after={_loadingStuckTimer:F4}");
+                    }
 
                     // Log progress every second
                     int currentSecond = (int)_loadingStuckTimer;
@@ -950,7 +957,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.37";
+        public const string PLUGIN_VERSION = "1.0.38";
     }
 
     /// <summary>

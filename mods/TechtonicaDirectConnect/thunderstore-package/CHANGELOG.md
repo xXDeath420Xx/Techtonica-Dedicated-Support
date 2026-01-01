@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.38
+- **DEBUG**: Added timer increment debug logging
+- Shows before/after values and deltaTime to confirm increment is happening
+- This will tell us if Time.deltaTime is 0 or if timer is being reset
+
 ## 1.0.37
 - **FIX**: Moved timer increment outside else block
 - Timer now increments every frame when isActive=true (not just when monitorActive=true)
