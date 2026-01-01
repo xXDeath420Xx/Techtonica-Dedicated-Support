@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.34
+- **DEBUG**: Added logging at every exit point in CheckLoadingMonitor
+- Logs when NetworkClient becomes inactive
+- Logs when LoadingUI instance becomes null
+- Logs when loading screen becomes inactive
+- Always logs exceptions (not suppressed)
+
 ## 1.0.33
 - **DEBUG**: Improved logging frequency (every second instead of every 2)
 - Added logging when loading screen becomes INACTIVE (to understand why monitor stops)

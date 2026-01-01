@@ -151,14 +151,31 @@ namespace TechtonicaDirectConnect
         // Debug logging for loading monitor
         private static bool _loadingMonitorDebugLogged = false;
 
+        // Counter for throttled logging
+        private static int _monitorCheckCount = 0;
+
         /// <summary>
         /// Monitors loading state and forces completion if stuck on "Generating Machines"
         /// This handles the case where NetworkMessageRelay.instance is null on dedicated servers
         /// </summary>
         private void CheckLoadingMonitor()
         {
+            _monitorCheckCount++;
+
             // Only monitor when connected as client
-            if (!NetworkClient.active || _finishLoadingCalled) return;
+            if (!NetworkClient.active)
+            {
+                if (_monitorCheckCount % 300 == 0 && _loadingMonitorActive)
+                    Log.LogWarning("[DirectConnect] Monitor: NetworkClient not active!");
+                return;
+            }
+
+            if (_finishLoadingCalled)
+            {
+                if (_monitorCheckCount % 300 == 0)
+                    Log.LogInfo("[DirectConnect] Monitor: finish already called, skipping");
+                return;
+            }
 
             try
             {
@@ -202,7 +219,11 @@ namespace TechtonicaDirectConnect
 
                 if (loadingUI == null)
                 {
-                    if (!_loadingMonitorDebugLogged)
+                    if (_loadingMonitorActive && _monitorCheckCount % 60 == 0)
+                    {
+                        Log.LogWarning("[DirectConnect] Monitor: LoadingUI instance became null!");
+                    }
+                    else if (!_loadingMonitorDebugLogged)
                     {
                         // List all fields for debugging
                         var fields = loadingUIType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
@@ -225,7 +246,10 @@ namespace TechtonicaDirectConnect
 
                 if (!isActive)
                 {
-                    // Loading is done, reset monitor
+                    if (_loadingMonitorActive)
+                    {
+                        Log.LogWarning($"[DirectConnect] Monitor: Loading screen became INACTIVE after {_loadingStuckTimer:F1}s!");
+                    }
                     _loadingMonitorActive = false;
                     _loadingStuckTimer = 0f;
                     return;
@@ -307,22 +331,11 @@ namespace TechtonicaDirectConnect
                         }
                     }
                 }
-                else if (_loadingMonitorActive)
-                {
-                    // Loading screen became inactive - log why
-                    Log.LogWarning($"[DirectConnect] Loading screen became INACTIVE after {_loadingStuckTimer:F1}s! finishCalled={_finishLoadingCalled}");
-                    _loadingMonitorActive = false;
-                    _loadingStuckTimer = 0f;
-                }
             }
             catch (Exception ex)
             {
-                // Log errors but don't spam
-                if (!_loadingMonitorDebugLogged)
-                {
-                    Log.LogError($"[DirectConnect] Loading monitor error: {ex}");
-                    _loadingMonitorDebugLogged = true;
-                }
+                // Always log errors now - they're critical for debugging
+                Log.LogError($"[DirectConnect] Loading monitor error: {ex.Message}");
             }
         }
 
@@ -917,7 +930,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.33";
+        public const string PLUGIN_VERSION = "1.0.34";
     }
 
     /// <summary>
