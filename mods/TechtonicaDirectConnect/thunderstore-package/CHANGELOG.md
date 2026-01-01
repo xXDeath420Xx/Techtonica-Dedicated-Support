@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.39
+- **FIX**: Use Time.unscaledDeltaTime instead of Time.deltaTime
+- Game sets timeScale=0 during loading, making deltaTime=0
+- unscaledDeltaTime ignores timeScale and works during loading!
+- Timer should now properly increment and trigger OnFinishLoading after 3 seconds
+
 ## 1.0.38
 - **DEBUG**: Added timer increment debug logging
 - Shows before/after values and deltaTime to confirm increment is happening

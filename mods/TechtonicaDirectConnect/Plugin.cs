@@ -312,15 +312,8 @@ namespace TechtonicaDirectConnect
                         Log.LogInfo($"[DirectConnect] Loading monitor started at state: '{currentState}'");
                     }
 
-                    // ALWAYS increment timer when isActive (moved outside else block)
-                    float beforeIncrement = _loadingStuckTimer;
-                    _loadingStuckTimer += Time.deltaTime;
-
-                    // Debug: log increment occasionally
-                    if (_monitorCheckCount % 120 == 0)
-                    {
-                        Log.LogInfo($"[DirectConnect] Timer increment: before={beforeIncrement:F4}, deltaTime={Time.deltaTime:F4}, after={_loadingStuckTimer:F4}");
-                    }
+                    // ALWAYS increment timer when isActive (use unscaledDeltaTime because game is paused during loading!)
+                    _loadingStuckTimer += Time.unscaledDeltaTime;
 
                     // Log progress every second
                     int currentSecond = (int)_loadingStuckTimer;
@@ -957,7 +950,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.38";
+        public const string PLUGIN_VERSION = "1.0.39";
     }
 
     /// <summary>
