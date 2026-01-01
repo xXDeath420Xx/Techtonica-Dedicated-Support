@@ -475,26 +475,34 @@ namespace TechtonicaDedicatedServer.Networking
                     continue;
                 }
 
+                // CRITICAL: Wait for client to be fully authenticated before doing ANYTHING
+                // Sending RPCs before authentication causes Mirror to close the connection
+                if (!conn.isAuthenticated)
+                {
+                    if (!_connectionFirstSeen.ContainsKey(connId))
+                    {
+                        _connectionFirstSeen[connId] = Time.realtimeSinceStartup;
+                        Plugin.Log.LogInfo($"[ServerConnectionHandler] Connection {connId} not authenticated yet, waiting...");
+                    }
+                    else if (Time.realtimeSinceStartup - _connectionFirstSeen[connId] > 5f)
+                    {
+                        // Wait 5 seconds before force authenticating (was 2s, too aggressive)
+                        Plugin.Log.LogInfo($"[ServerConnectionHandler] Connection {connId} still not authenticated after 5s, force authenticating...");
+                        conn.isAuthenticated = true;
+                    }
+                    continue; // Don't process unauthenticated connections AT ALL
+                }
+
+                // Note: We don't wait for conn.isReady - it may never become ready in headless mode
+                // Just log if not ready and continue processing
+                if (!conn.isReady)
+                {
+                    Plugin.Log.LogInfo($"[ServerConnectionHandler] Connection {connId} authenticated but not ready (continuing anyway)");
+                }
+
                 // Check if this connection has a player
                 if (conn.identity == null)
                 {
-                    // Wait for client to be authenticated first
-                    if (!conn.isAuthenticated)
-                    {
-                        // Check if connection has been waiting for a while (more than 2 seconds)
-                        // If so, force authenticate it
-                        if (!_connectionFirstSeen.ContainsKey(connId))
-                        {
-                            _connectionFirstSeen[connId] = Time.realtimeSinceStartup;
-                            Plugin.Log.LogInfo($"[ServerConnectionHandler] Connection {connId} not authenticated yet, waiting...");
-                        }
-                        else if (Time.realtimeSinceStartup - _connectionFirstSeen[connId] > 2f)
-                        {
-                            Plugin.Log.LogInfo($"[ServerConnectionHandler] Connection {connId} still not authenticated after 2s, force authenticating...");
-                            conn.isAuthenticated = true;
-                        }
-                        continue;
-                    }
 
                     // Try to spawn a player for this connection
                     if (!_connectionsSpawningPlayer.Contains(connId))
