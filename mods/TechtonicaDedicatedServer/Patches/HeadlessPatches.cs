@@ -2281,7 +2281,48 @@ namespace TechtonicaDedicatedServer.Patches
         {
             try
             {
-                Plugin.Log.LogInfo($"[HeadlessPatches] RequestCurrentSimTick from conn={sender?.connectionId}, tick={_currentSimTick}");
+                // Get the current tick from MachineManager if available, otherwise use cached value
+                int tickToSend = (int)_currentSimTick;
+
+                // Try to get actual MachineManager.instance.curTick
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var instanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        var mmInstance = instanceField.GetValue(null);
+                        if (mmInstance != null)
+                        {
+                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            if (curTickField != null)
+                            {
+                                tickToSend = (int)curTickField.GetValue(mmInstance);
+                            }
+                        }
+                    }
+                }
+
+                // Also update FactorySimManager.lastSyncTick if available
+                var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType != null)
+                {
+                    var fsmInstanceProp = factorySimType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (fsmInstanceProp != null)
+                    {
+                        var fsmInstance = fsmInstanceProp.GetValue(null);
+                        if (fsmInstance != null)
+                        {
+                            var lastSyncField = factorySimType.GetField("_lastSyncTick", BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (lastSyncField != null)
+                            {
+                                lastSyncField.SetValue(fsmInstance, tickToSend);
+                            }
+                        }
+                    }
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] RequestCurrentSimTick from conn={sender?.connectionId}, tick={tickToSend}");
 
                 // Try to find the ProcessCurrentSimTick method to respond to client
                 var relayType = __instance.GetType();
@@ -2291,8 +2332,8 @@ namespace TechtonicaDedicatedServer.Patches
                 if (processMethod != null && sender != null)
                 {
                     // Call ProcessCurrentSimTick(sender, tick) to send response to client
-                    processMethod.Invoke(__instance, new object[] { sender, (int)_currentSimTick });
-                    Plugin.Log.LogInfo($"[HeadlessPatches] Sent ProcessCurrentSimTick({_currentSimTick}) to connection {sender.connectionId}");
+                    processMethod.Invoke(__instance, new object[] { sender, tickToSend });
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Sent ProcessCurrentSimTick({tickToSend}) to connection {sender.connectionId}");
                 }
                 else
                 {

@@ -409,6 +409,12 @@ namespace TechtonicaDedicatedServer.Networking
                 if (Mirror.NetworkServer.active)
                 {
                     Plugin.Log.LogInfo($"[AutoNavigate] HOST STARTED on port {port}!");
+
+                    // CRITICAL: Spawn NetworkMessageRelay for game commands to work
+                    SpawnNetworkMessageRelay();
+
+                    // CRITICAL: Create stub game systems for tick sync
+                    CreateStubGameSystems();
                 }
                 else
                 {
@@ -478,6 +484,170 @@ namespace TechtonicaDedicatedServer.Networking
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"[AutoNavigate] SetupKCPTransport error: {ex.Message}");
+            }
+        }
+
+        // Cached NetworkMessageRelay instance
+        private static object _serverNetworkRelay;
+
+        /// <summary>
+        /// Spawn a NetworkMessageRelay on the server for handling game commands.
+        /// This is critical for client-server communication.
+        /// </summary>
+        private static void SpawnNetworkMessageRelay()
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[AutoNavigate] Creating NetworkMessageRelay for server...");
+
+                // Find the NetworkMessageRelay type
+                var relayType = HarmonyLib.AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Plugin.Log.LogError("[AutoNavigate] NetworkMessageRelay type not found!");
+                    return;
+                }
+
+                // Check if there's already an instance
+                var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                if (instanceField != null)
+                {
+                    var existing = instanceField.GetValue(null);
+                    if (existing != null)
+                    {
+                        Plugin.Log.LogInfo("[AutoNavigate] NetworkMessageRelay.instance already exists");
+                        _serverNetworkRelay = existing;
+                        return;
+                    }
+                }
+
+                // Create a new GameObject with NetworkMessageRelay
+                var go = new GameObject("ServerNetworkMessageRelay");
+                UnityEngine.Object.DontDestroyOnLoad(go);
+
+                // Add NetworkIdentity first (required for NetworkBehaviour)
+                var networkIdentity = go.AddComponent<Mirror.NetworkIdentity>();
+
+                // Add NetworkMessageRelay component
+                var relay = go.AddComponent(relayType);
+
+                // Set the static instance
+                if (instanceField != null)
+                {
+                    instanceField.SetValue(null, relay);
+                    Plugin.Log.LogInfo("[AutoNavigate] Set NetworkMessageRelay.instance");
+                }
+
+                // Spawn on the network so clients can see it
+                if (Mirror.NetworkServer.active)
+                {
+                    Mirror.NetworkServer.Spawn(go);
+                    Plugin.Log.LogInfo("[AutoNavigate] NetworkMessageRelay spawned on network!");
+                }
+
+                _serverNetworkRelay = relay;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] SpawnNetworkMessageRelay error: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        // Cached stub game systems
+        private static object _stubFactorySimManager;
+        private static object _stubMachineManager;
+
+        /// <summary>
+        /// Create stub game systems (FactorySimManager, MachineManager) for headless mode.
+        /// These are minimal implementations that allow tick sync and basic operations.
+        /// </summary>
+        private static void CreateStubGameSystems()
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[AutoNavigate] Creating stub game systems for headless mode...");
+
+                // Create stub MachineManager first (it's a simple class, not MonoBehaviour)
+                var machineManagerType = HarmonyLib.AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var instanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        var existing = instanceField.GetValue(null);
+                        if (existing == null)
+                        {
+                            // Create new MachineManager
+                            var stubMM = Activator.CreateInstance(machineManagerType);
+                            instanceField.SetValue(null, stubMM);
+                            _stubMachineManager = stubMM;
+
+                            // Set curTick to match save data
+                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            if (curTickField != null)
+                            {
+                                curTickField.SetValue(stubMM, 724189); // Default tick from save
+                                Plugin.Log.LogInfo("[AutoNavigate] Created stub MachineManager with curTick=724189");
+                            }
+                        }
+                        else
+                        {
+                            Plugin.Log.LogInfo("[AutoNavigate] MachineManager.instance already exists");
+                            _stubMachineManager = existing;
+                        }
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] MachineManager type not found");
+                }
+
+                // FactorySimManager is a MonoBehaviour - create a GameObject for it
+                var factorySimType = HarmonyLib.AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType != null)
+                {
+                    // Check static _instance field
+                    var instanceField = factorySimType.GetField("_instance", BindingFlags.NonPublic | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        var existing = instanceField.GetValue(null);
+                        if (existing == null)
+                        {
+                            // Create GameObject with FactorySimManager
+                            var go = new GameObject("StubFactorySimManager");
+                            UnityEngine.Object.DontDestroyOnLoad(go);
+
+                            var stubFSM = go.AddComponent(factorySimType);
+                            _stubFactorySimManager = stubFSM;
+
+                            // The OnEnable method should set _instance = this
+                            Plugin.Log.LogInfo("[AutoNavigate] Created stub FactorySimManager");
+
+                            // Set lastSyncTick
+                            var lastSyncField = factorySimType.GetField("_lastSyncTick", BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (lastSyncField != null)
+                            {
+                                lastSyncField.SetValue(stubFSM, 724189);
+                                Plugin.Log.LogInfo("[AutoNavigate] Set FactorySimManager.lastSyncTick=724189");
+                            }
+                        }
+                        else
+                        {
+                            Plugin.Log.LogInfo("[AutoNavigate] FactorySimManager._instance already exists");
+                            _stubFactorySimManager = existing;
+                        }
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] FactorySimManager type not found");
+                }
+
+                Plugin.Log.LogInfo("[AutoNavigate] Stub game systems created");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] CreateStubGameSystems error: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
