@@ -204,19 +204,317 @@ namespace TechtonicaPreloader
                 // Patch the quit check in initialization
                 PatchQuitOnSteamFail(module);
 
-                // CRITICAL: Patch NetworkedPlayer.UserCode_RequestInitialSaveData to skip the problematic code
-                // This prevents crashes when clients request save data in headless mode
-                PatchNetworkedPlayerSaveData(module);
-
-                // CRITICAL: Patch SaveState methods to handle headless mode
-                PatchSaveStateMethods(module);
+                // GHOST HOST MODE: Do NOT patch NetworkedPlayer or SaveState!
+                // Since we're loading the game properly, these will work normally.
+                // The server will have the full game state and can respond to save data requests.
+                Console.WriteLine("[SteamBypassPatcher] GHOST HOST MODE: NetworkedPlayer and SaveState will work normally!");
+                // PatchNetworkedPlayerSaveData(module); // DISABLED for ghost host
+                // PatchSaveStateMethods(module); // DISABLED for ghost host
 
                 // CRITICAL: Patch TVEGlobalVolume to prevent graphics errors
                 PatchTVEGlobalVolume(module);
+
+                // GHOST HOST MODE: Do NOT skip scene loading!
+                // Let the server load into the game world properly like a normal player.
+                // The server will act as a "ghost host" - a real player in the world.
+                // This allows the game state (GameLogic, MachineManager, etc.) to initialize properly.
+                // Clients can then connect and interact with the world normally.
+                Console.WriteLine("[SteamBypassPatcher] GHOST HOST MODE: Scene loading will proceed normally!");
+                Console.WriteLine("[SteamBypassPatcher] Server will load into game world as a proper host player.");
+                // PatchFlowManagerSceneLoading(module); // DISABLED - let scenes load!
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[SteamBypassPatcher] Error patching: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Patch FlowManager's LoadScreenCoroutine to use synchronous scene loading.
+        /// Unity's async scene loading doesn't complete properly in Wine headless mode.
+        /// This patch replaces the entire MoveNext with one that loads scenes synchronously.
+        /// </summary>
+        private static void PatchFlowManagerSceneLoading(ModuleDefinition module)
+        {
+            try
+            {
+                var flowManagerType = module.Types.FirstOrDefault(t => t.Name == "FlowManager");
+                if (flowManagerType == null)
+                {
+                    Console.WriteLine("[SteamBypassPatcher] FlowManager type not found");
+                    return;
+                }
+
+                Console.WriteLine("[SteamBypassPatcher] Found FlowManager type");
+
+                // Find the LoadScreenCoroutine state machine
+                // It's compiled as a nested type like <LoadScreenCoroutine>d__XX
+                var coroutineType = flowManagerType.NestedTypes.FirstOrDefault(t =>
+                    t.Name.Contains("LoadScreenCoroutine"));
+
+                if (coroutineType == null)
+                {
+                    Console.WriteLine("[SteamBypassPatcher] LoadScreenCoroutine state machine not found");
+                    // List nested types for debugging
+                    foreach (var nested in flowManagerType.NestedTypes)
+                    {
+                        Console.WriteLine($"[SteamBypassPatcher]   Nested type: {nested.Name}");
+                    }
+                    return;
+                }
+
+                Console.WriteLine($"[SteamBypassPatcher] Found coroutine type: {coroutineType.Name}");
+
+                var moveNextMethod = coroutineType.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+                if (moveNextMethod == null)
+                {
+                    Console.WriteLine("[SteamBypassPatcher] MoveNext method not found");
+                    return;
+                }
+
+                Console.WriteLine($"[SteamBypassPatcher] Found MoveNext with {moveNextMethod.Body.Instructions.Count} instructions");
+
+                // First, analyze what scenes are being loaded and log them
+                AnalyzeSceneLoading(moveNextMethod, module);
+
+                // Now patch: Replace entire MoveNext to load scenes synchronously
+                PatchMoveNextForSyncLoading(moveNextMethod, coroutineType, module);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SteamBypassPatcher] FlowManager patch error: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Analyze the MoveNext to understand what scenes are being loaded
+        /// </summary>
+        private static void AnalyzeSceneLoading(MethodDefinition method, ModuleDefinition module)
+        {
+            try
+            {
+                var instructions = method.Body.Instructions;
+
+                Console.WriteLine("[SteamBypassPatcher] Analyzing LoadScreenCoroutine scene loading:");
+
+                // Find string constants that look like scene names
+                foreach (var instr in instructions)
+                {
+                    if (instr.OpCode == OpCodes.Ldstr)
+                    {
+                        var str = instr.Operand as string;
+                        if (str != null && (str.Contains("Scene") || str.Contains("Loading") || str.Contains("Player") || str.Contains("Menu")))
+                        {
+                            Console.WriteLine($"[SteamBypassPatcher]   Scene string: \"{str}\"");
+                        }
+                    }
+                }
+
+                // Find calls to LoadSceneAsync
+                int asyncCallCount = 0;
+                foreach (var instr in instructions)
+                {
+                    if (instr.OpCode == OpCodes.Call || instr.OpCode == OpCodes.Callvirt)
+                    {
+                        var methodRef = instr.Operand as MethodReference;
+                        if (methodRef != null)
+                        {
+                            if (methodRef.Name == "LoadSceneAsync")
+                            {
+                                Console.WriteLine($"[SteamBypassPatcher]   Found LoadSceneAsync: {methodRef.FullName}");
+                                asyncCallCount++;
+                            }
+                            else if (methodRef.Name == "LoadScene")
+                            {
+                                Console.WriteLine($"[SteamBypassPatcher]   Found LoadScene: {methodRef.FullName}");
+                            }
+                        }
+                    }
+                }
+
+                Console.WriteLine($"[SteamBypassPatcher] Total LoadSceneAsync calls: {asyncCallCount}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SteamBypassPatcher] Analyze error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Replace MoveNext with a version that loads scenes synchronously.
+        /// The original coroutine waits for async operations that never complete in Wine.
+        /// Our version will:
+        /// 1. Load "Loading" scene synchronously
+        /// 2. Load "Player Scene" synchronously
+        /// 3. Call the completion callback
+        /// 4. Return false (coroutine done)
+        /// </summary>
+        private static void PatchMoveNextForSyncLoading(MethodDefinition moveNext, TypeDefinition coroutineType, ModuleDefinition module)
+        {
+            try
+            {
+                Console.WriteLine("[SteamBypassPatcher] Patching MoveNext for synchronous scene loading...");
+
+                // Find the fields we need from the coroutine state machine
+                // The coroutine stores: <>4__this (FlowManager instance), sceneName, callback, etc.
+                FieldDefinition sceneNameField = null;
+                FieldDefinition callbackField = null;
+                FieldDefinition thisField = null;
+                FieldDefinition stateField = null;
+
+                foreach (var field in coroutineType.Fields)
+                {
+                    Console.WriteLine($"[SteamBypassPatcher]   Coroutine field: {field.Name} : {field.FieldType.Name}");
+
+                    if (field.Name.Contains("sceneName") || (field.FieldType.FullName == "System.String" && !field.Name.Contains("state")))
+                    {
+                        sceneNameField = field;
+                    }
+                    if (field.Name.Contains("callback") || field.FieldType.Name == "Action")
+                    {
+                        callbackField = field;
+                    }
+                    if (field.Name.Contains("this") || field.FieldType.Name == "FlowManager")
+                    {
+                        thisField = field;
+                    }
+                    if (field.Name.Contains("state") && field.FieldType.FullName == "System.Int32")
+                    {
+                        stateField = field;
+                    }
+                }
+
+                // HEADLESS MODE: We don't need to load scenes, just skip and call callback
+                // Scene loading doesn't work in Wine/headless mode anyway
+                Console.WriteLine("[SteamBypassPatcher] HEADLESS MODE: Will skip scene loading in LoadScreenCoroutine");
+
+                // Clear the existing method body
+                var il = moveNext.Body.GetILProcessor();
+                moveNext.Body.Instructions.Clear();
+                moveNext.Body.ExceptionHandlers.Clear();
+                moveNext.Body.Variables.Clear();
+
+                // Add a local for the state check
+                moveNext.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Int32));
+
+                // Build new method body:
+                // if (state != 0) return false; // Already ran
+                // state = -1;
+                // SceneManager.LoadScene("Loading");
+                // SceneManager.LoadScene("Player Scene");
+                // Time.timeScale = 1; // Important!
+                // if (callback != null) callback();
+                // return false;
+
+                var returnFalseInstr = il.Create(OpCodes.Ldc_I4_0);
+
+                // Check state field
+                if (stateField != null)
+                {
+                    // if (this.<>1__state != 0) return false
+                    il.Append(il.Create(OpCodes.Ldarg_0));
+                    il.Append(il.Create(OpCodes.Ldfld, stateField));
+                    il.Append(il.Create(OpCodes.Brtrue, returnFalseInstr));
+
+                    // this.<>1__state = -1
+                    il.Append(il.Create(OpCodes.Ldarg_0));
+                    il.Append(il.Create(OpCodes.Ldc_I4_M1));
+                    il.Append(il.Create(OpCodes.Stfld, stateField));
+                }
+
+                // Log that we're using patched loading
+                // HEADLESS SERVER MODE: Skip scene loading entirely
+                // Unity scene loading doesn't work properly in Wine headless mode
+                // The server doesn't need scenes loaded - it just relays save data to clients
+                AddDebugLog(il, module, "[PRELOADER] LoadScreenCoroutine PATCHED - HEADLESS MODE: Skipping scene loading!");
+
+                // Don't try to load scenes - they fail in Wine with isLoaded=False
+                // Just proceed directly to callback so the server can start
+                AddDebugLog(il, module, "[PRELOADER] Skipping scene loading (not needed for dedicated server)");
+
+                // Set Time.timeScale = 1f
+                try
+                {
+                    MethodReference timeScaleSetter = null;
+                    foreach (var asm in module.AssemblyReferences)
+                    {
+                        try
+                        {
+                            var resolvedAsm = module.AssemblyResolver.Resolve(asm);
+                            if (resolvedAsm != null)
+                            {
+                                var timeType = resolvedAsm.MainModule.Types
+                                    .FirstOrDefault(t => t.Name == "Time" && t.Namespace == "UnityEngine");
+                                if (timeType != null)
+                                {
+                                    var prop = timeType.Properties.FirstOrDefault(p => p.Name == "timeScale");
+                                    if (prop != null && prop.SetMethod != null)
+                                    {
+                                        timeScaleSetter = module.ImportReference(prop.SetMethod);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (timeScaleSetter != null)
+                    {
+                        il.Append(il.Create(OpCodes.Ldc_R4, 1.0f));
+                        il.Append(il.Create(OpCodes.Call, timeScaleSetter));
+                        Console.WriteLine("[SteamBypassPatcher] Added Time.timeScale = 1f");
+                    }
+                }
+                catch (Exception timeEx)
+                {
+                    Console.WriteLine($"[SteamBypassPatcher] Could not add Time.timeScale setter: {timeEx.Message}");
+                }
+
+                // Call callback if not null
+                if (callbackField != null)
+                {
+                    var skipCallbackLabel = il.Create(OpCodes.Nop);
+
+                    // if (callback != null)
+                    il.Append(il.Create(OpCodes.Ldarg_0));
+                    il.Append(il.Create(OpCodes.Ldfld, callbackField));
+                    il.Append(il.Create(OpCodes.Brfalse, skipCallbackLabel));
+
+                    // callback.Invoke()
+                    il.Append(il.Create(OpCodes.Ldarg_0));
+                    il.Append(il.Create(OpCodes.Ldfld, callbackField));
+
+                    // Find Action.Invoke
+                    var actionType = callbackField.FieldType.Resolve();
+                    if (actionType != null)
+                    {
+                        var invokeMethod = actionType.Methods.FirstOrDefault(m => m.Name == "Invoke");
+                        if (invokeMethod != null)
+                        {
+                            il.Append(il.Create(OpCodes.Callvirt, module.ImportReference(invokeMethod)));
+                            AddDebugLog(il, module, "[PRELOADER] Called load completion callback");
+                        }
+                    }
+
+                    il.Append(skipCallbackLabel);
+                }
+
+                AddDebugLog(il, module, "[PRELOADER] LoadScreenCoroutine completed (sync)");
+
+                // return false (coroutine finished)
+                il.Append(returnFalseInstr);
+                il.Append(il.Create(OpCodes.Ret));
+
+                Console.WriteLine($"[SteamBypassPatcher] Patched MoveNext with {moveNext.Body.Instructions.Count} instructions");
+                foreach (var instr in moveNext.Body.Instructions)
+                {
+                    Console.WriteLine($"[SteamBypassPatcher]   {instr.OpCode} {instr.Operand}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SteamBypassPatcher] MoveNext patch error: {ex}");
             }
         }
 

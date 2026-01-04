@@ -569,6 +569,9 @@ namespace TechtonicaDedicatedServer
             // Check for scheduled server start (must happen on main thread)
             Networking.AutoLoadManager.Update();
 
+            // Process pending authentication (delayed ServerAccept)
+            Networking.DirectConnectManager.ProcessPendingAuth();
+
             // Check if thread triggered auto-load
             if (_threadTriggeredAutoLoad && !_autoLoadStarted)
             {

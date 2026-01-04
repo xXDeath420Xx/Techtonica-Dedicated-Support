@@ -33,6 +33,28 @@ namespace TechtonicaDedicatedServer.Networking
         private static int _updateCallCount;
         private static float _lastUpdateLogTime;
 
+        // Scene loading state
+        private static bool _sceneLoadingInitiated;
+        private static float _sceneLoadStartTime;
+        private static bool _forceLoadedScenes;
+
+        // Ghost host auto-navigation state
+        private static bool _mainMenuHandled;
+        private static bool _loadingPromptHandled;
+        private static float _lastAutoClickTime;
+
+        // Loading scene timeout monitoring
+        private static float _loadingSceneEnteredTime;
+        private static bool _loadingSceneMonitorActive;
+        private static bool _forcedLoadingCompletion;
+        private const float LOADING_TIMEOUT_SECONDS = 5f;
+
+        // Main Menu stuck detection
+        private static float _mainMenuStuckStartTime;
+        private static bool _mainMenuStuckMonitorActive;
+        private static bool _forcedMainMenuBypass;
+        private const float MAIN_MENU_TIMEOUT_SECONDS = 10f;
+
         /// <summary>
         /// Called from Plugin.Update() to handle scheduled server start on main thread.
         /// </summary>
@@ -47,6 +69,19 @@ namespace TechtonicaDedicatedServer.Networking
                 Plugin.Log.LogInfo($"[AutoLoad] Update() #{_updateCallCount}, pending={_serverStartPending}, scheduled={_serverStartScheduledTime:F1}, now={Time.realtimeSinceStartup:F1}");
             }
 
+            // CRITICAL: Ensure Time.timeScale is not 0 - the game freezes it during loading
+            // which prevents coroutines from running. We need to keep it at 1 for headless mode.
+            if (_isAutoLoading && Time.timeScale < 0.5f)
+            {
+                Time.timeScale = 1f;
+            }
+
+            // GHOST HOST MODE: Auto-navigate through menus and loading screens
+            if (Plugin.AutoStartServer.Value)
+            {
+                TryAutoNavigate();
+            }
+
             if (_serverStartPending && Time.realtimeSinceStartup >= _serverStartScheduledTime)
             {
                 _serverStartPending = false;
@@ -59,29 +94,72 @@ namespace TechtonicaDedicatedServer.Networking
                     string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
                     Plugin.DebugLog($"[AutoLoad] Current scene: {currentScene}");
 
-                    // In headless mode, the game may not fully transition to Player Scene
-                    // The server can still work from Main Menu - it just relays save data
-                    // Only wait for Loading scene to complete
-                    bool isLoading = currentScene == "Loading";
+                    // GHOST HOST MODE: Wait for game world to be loaded
+                    // Server needs to be in the game world to properly host
+                    bool isMainMenu = currentScene == "Main Menu";
+                    bool isPlayerScene = currentScene == "Player Scene" || currentScene.Contains("Player");
+                    bool isLoadingScene = currentScene == "Loading";
 
-                    if (_serverStartAttempts < 3 && isLoading)
+                    if (isMainMenu)
                     {
-                        Plugin.DebugLog($"[AutoLoad] Still in Loading scene, waiting another 5 seconds...");
+                        Plugin.DebugLog("[AutoLoad] GHOST HOST MODE: Still on Main Menu - waiting for game to load...");
+                        Plugin.DebugLog("[AutoLoad] Rescheduling server start for 5 more seconds...");
                         _serverStartScheduledTime = Time.realtimeSinceStartup + 5f;
                         _serverStartPending = true;
-                        return;
+                        _serverStartAttempts--; // Don't count this as a real attempt
+                        return; // Wait longer
                     }
 
-                    Plugin.DebugLog($"[AutoLoad] Starting server on scene '{currentScene}' (attempt #{_serverStartAttempts})");
+                    // Check if game systems are initialized
+                    bool gameSystemsReady = CheckGameSystemsReady();
+                    if (!gameSystemsReady)
+                    {
+                        if (_serverStartAttempts < 20)
+                        {
+                            Plugin.Log.LogInfo($"[AutoLoad] Game systems not ready yet (attempt #{_serverStartAttempts}). Waiting 3 more seconds...");
+                            _serverStartScheduledTime = Time.realtimeSinceStartup + 3f;
+                            _serverStartPending = true;
+                            return;
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning("[AutoLoad] Game systems still not ready after 20 attempts, starting HOST anyway...");
+                        }
+                    }
 
-                    if (DirectConnectManager.StartServer())
+                    if (isPlayerScene || gameSystemsReady)
+                    {
+                        Plugin.DebugLog("[AutoLoad] GHOST HOST MODE: Game world loaded! Starting as HOST...");
+                    }
+
+                    // Log loaded scenes for debugging
+                    int sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                    Plugin.DebugLog($"[AutoLoad] Loaded scenes ({sceneCount}):");
+                    for (int i = 0; i < sceneCount; i++)
+                    {
+                        var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                        Plugin.DebugLog($"[AutoLoad]   - {scene.name} (loaded={scene.isLoaded})");
+                    }
+
+                    // GHOST HOST MODE: Start as HOST so we have a player in the world
+                    Plugin.DebugLog($"[AutoLoad] Starting HOST on scene '{currentScene}' (attempt #{_serverStartAttempts})");
+
+                    if (DirectConnectManager.StartHost())
                     {
                         var addr = DirectConnectManager.GetServerAddress();
-                        Plugin.DebugLog($"[AutoLoad] Server started successfully on {addr}");
+                        Plugin.DebugLog($"[AutoLoad] HOST started successfully on {addr}");
+                        Plugin.DebugLog("[AutoLoad] Ghost host is now in the game world. Clients can connect!");
                     }
                     else
                     {
-                        Plugin.DebugLog("[AutoLoad] ERROR: Failed to start server!");
+                        Plugin.DebugLog("[AutoLoad] ERROR: Failed to start HOST!");
+                        // Retry after a delay
+                        if (_serverStartAttempts < 30)
+                        {
+                            Plugin.DebugLog("[AutoLoad] Will retry in 5 seconds...");
+                            _serverStartScheduledTime = Time.realtimeSinceStartup + 5f;
+                            _serverStartPending = true;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -90,6 +168,766 @@ namespace TechtonicaDedicatedServer.Networking
                 }
 
                 _isAutoLoading = false;
+            }
+        }
+
+        /// <summary>
+        /// Check if key game systems are initialized and ready.
+        /// </summary>
+        private static bool CheckGameSystemsReady()
+        {
+            try
+            {
+                // Check for Player Scene loaded
+                bool playerSceneLoaded = false;
+                int sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                for (int i = 0; i < sceneCount; i++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    if (scene.name == "Player Scene" && scene.isLoaded)
+                    {
+                        playerSceneLoaded = true;
+                        break;
+                    }
+                }
+
+                if (!playerSceneLoaded)
+                {
+                    Plugin.Log.LogInfo("[AutoLoad] Player Scene not fully loaded yet");
+                    return false;
+                }
+
+                // Check for GameState.instance
+                var gameStateType = AccessTools.TypeByName("GameState");
+                if (gameStateType != null)
+                {
+                    var instanceField = gameStateType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    var gameState = instanceField?.GetValue(null);
+                    if (gameState == null)
+                    {
+                        Plugin.Log.LogInfo("[AutoLoad] GameState.instance is null");
+                        return false;
+                    }
+                }
+
+                // Check for FactorySimManager.instance
+                var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType != null)
+                {
+                    var instanceField = factorySimType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    var factorySim = instanceField?.GetValue(null);
+                    if (factorySim == null)
+                    {
+                        Plugin.Log.LogInfo("[AutoLoad] FactorySimManager.instance is null");
+                        return false;
+                    }
+                }
+
+                // Check for Player.instance
+                var playerType = AccessTools.TypeByName("Player");
+                if (playerType != null)
+                {
+                    var instanceField = playerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    var player = instanceField?.GetValue(null);
+                    if (player == null)
+                    {
+                        Plugin.Log.LogInfo("[AutoLoad] Player.instance is null");
+                        return false;
+                    }
+                }
+
+                Plugin.Log.LogInfo("[AutoLoad] All game systems ready!");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[AutoLoad] CheckGameSystemsReady error: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// GHOST HOST MODE: Auto-navigate through menus and loading screens.
+        /// This simulates user input to get past prompts without human interaction.
+        /// </summary>
+        private static int _autoNavLogCount = 0;
+        private static float _lastAutoNavLog = -100f; // Start negative so first log triggers immediately
+
+        private static void TryAutoNavigate()
+        {
+            _autoNavLogCount++;
+
+            // Log first call to verify method is running
+            if (_autoNavLogCount == 1)
+            {
+                Plugin.Log.LogInfo("[AutoNav] FIRST CALL to TryAutoNavigate()!");
+            }
+
+            // Log state every 2 seconds
+            if (Time.realtimeSinceStartup - _lastAutoNavLog >= 2f)
+            {
+                _lastAutoNavLog = Time.realtimeSinceStartup;
+                string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+                Plugin.Log.LogInfo($"[AutoNav] #{_autoNavLogCount}: scene={scene}, handled={_mainMenuHandled}, bypass={_forcedMainMenuBypass}, stuckMon={_mainMenuStuckMonitorActive}, lastClick={_lastAutoClickTime:F1}");
+            }
+
+            // Rate limit auto-clicks
+            float timeSinceLastClick = Time.realtimeSinceStartup - _lastAutoClickTime;
+            if (timeSinceLastClick < 1f)
+            {
+                return;
+            }
+
+            try
+            {
+                string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+                // Handle Main Menu - auto-click Continue/Load Game
+                if (currentScene == "Main Menu" && !_mainMenuHandled)
+                {
+                    TryAutoClickMainMenu();
+                }
+
+                // DETECT STUCK ON MAIN MENU: If we've tried to load but scene hasn't changed
+                if (currentScene == "Main Menu" && _mainMenuHandled && !_forcedMainMenuBypass)
+                {
+                    if (!_mainMenuStuckMonitorActive)
+                    {
+                        _mainMenuStuckMonitorActive = true;
+                        _mainMenuStuckStartTime = Time.realtimeSinceStartup;
+                        Plugin.Log.LogInfo("[AutoNavigate] Started Main Menu stuck monitor...");
+                    }
+                    else
+                    {
+                        float timeStuck = Time.realtimeSinceStartup - _mainMenuStuckStartTime;
+                        // Log every 2 seconds
+                        if (((int)timeStuck) % 2 == 0 && ((int)(timeStuck * 10) % 20 < 10))
+                        {
+                            Plugin.Log.LogInfo($"[AutoNavigate] Main Menu stuck for {timeStuck:F1}s (timeout at {MAIN_MENU_TIMEOUT_SECONDS}s)");
+                        }
+                        if (timeStuck >= MAIN_MENU_TIMEOUT_SECONDS)
+                        {
+                            Plugin.Log.LogWarning($"[AutoNavigate] STUCK on Main Menu for {timeStuck:F1}s - forcing scene bypass!");
+                            ForceSceneTransition();
+                        }
+                    }
+                }
+                else if (currentScene != "Main Menu")
+                {
+                    // We left Main Menu, stop monitoring
+                    _mainMenuStuckMonitorActive = false;
+                }
+
+                // Handle Loading Screen - bypass "press any key" prompt
+                if (!_loadingPromptHandled)
+                {
+                    TryBypassLoadingPrompt();
+                }
+            }
+            catch (Exception ex)
+            {
+                // Don't spam logs
+                if (_updateCallCount % 300 == 0)
+                {
+                    Plugin.DebugLog($"[AutoNavigate] Error: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Force scene transition when async loading is broken.
+        /// Since Unity scene loading doesn't work in Wine headless mode,
+        /// we just start the HOST directly from Main Menu.
+        /// </summary>
+        private static void ForceSceneTransition()
+        {
+            try
+            {
+                _forcedMainMenuBypass = true;
+                Plugin.Log.LogWarning("[AutoNavigate] Scene loading broken - starting HOST from Main Menu!");
+
+                // Scene loading doesn't work in Wine, so just start the server
+                // Clients will connect and receive save data even without full game state
+                ForceStartHost();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] ForceSceneTransition error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Force start the HOST even without proper scene loading.
+        /// </summary>
+        private static void ForceStartHost()
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[AutoNavigate] Force-starting HOST from Main Menu...");
+
+                // CRITICAL: Set up KCP transport before starting the host
+                // FizzyFacepunch (Steam) won't work without Steam
+                SetupKCPTransport();
+
+                var networkManager = Mirror.NetworkManager.singleton;
+                if (networkManager == null)
+                {
+                    Plugin.Log.LogError("[AutoNavigate] Could not find NetworkManager.singleton!");
+                    return;
+                }
+
+                Plugin.Log.LogInfo($"[AutoNavigate] Found NetworkManager: {networkManager.GetType().Name}");
+
+                // Set the network address
+                networkManager.networkAddress = "0.0.0.0";
+
+                // Get the port from our config
+                ushort port = (ushort)Plugin.ServerPort.Value;
+
+                // Set the transport port
+                var transport = Mirror.Transport.activeTransport;
+                if (transport != null)
+                {
+                    Plugin.Log.LogInfo($"[AutoNavigate] Active transport: {transport.GetType().Name}");
+
+                    var portField = transport.GetType().GetField("Port", BindingFlags.Public | BindingFlags.Instance);
+                    var portProp = transport.GetType().GetProperty("Port", BindingFlags.Public | BindingFlags.Instance);
+
+                    if (portField != null)
+                        portField.SetValue(transport, port);
+                    else if (portProp != null)
+                        portProp.SetValue(transport, port);
+
+                    Plugin.Log.LogInfo($"[AutoNavigate] Set transport port to {port}");
+                }
+
+                // Start as host
+                networkManager.StartHost();
+                Plugin.Log.LogInfo("[AutoNavigate] StartHost() called!");
+
+                // Check if server started
+                if (Mirror.NetworkServer.active)
+                {
+                    Plugin.Log.LogInfo($"[AutoNavigate] HOST STARTED on port {port}!");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] StartHost called but NetworkServer.active is false");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] ForceStartHost error: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Set up KCP transport for the server.
+        /// </summary>
+        private static void SetupKCPTransport()
+        {
+            try
+            {
+                var networkManager = Mirror.NetworkManager.singleton;
+                if (networkManager == null)
+                {
+                    Plugin.Log.LogError("[AutoNavigate] Cannot setup KCP - NetworkManager.singleton is null");
+                    return;
+                }
+
+                // Find KCP transport on the NetworkManager GameObject
+                var kcpTransport = networkManager.GetComponent<kcp2k.KcpTransport>();
+                if (kcpTransport == null)
+                {
+                    // Try to find it as a child or add it
+                    var go = networkManager.gameObject;
+                    kcpTransport = go.GetComponentInChildren<kcp2k.KcpTransport>();
+
+                    if (kcpTransport == null)
+                    {
+                        // Add KCP transport
+                        Plugin.Log.LogInfo("[AutoNavigate] Adding KcpTransport to NetworkManager");
+                        kcpTransport = go.AddComponent<kcp2k.KcpTransport>();
+                    }
+                }
+
+                if (kcpTransport != null)
+                {
+                    Plugin.Log.LogInfo("[AutoNavigate] Found/created KcpTransport, setting as active");
+
+                    // Set port
+                    kcpTransport.Port = (ushort)Plugin.ServerPort.Value;
+
+                    // Set as the active transport
+                    Mirror.Transport.activeTransport = kcpTransport;
+
+                    // Also set on NetworkManager
+                    var transportField = typeof(Mirror.NetworkManager).GetField("transport", BindingFlags.Public | BindingFlags.Instance);
+                    if (transportField != null)
+                    {
+                        transportField.SetValue(networkManager, kcpTransport);
+                    }
+
+                    Plugin.Log.LogInfo($"[AutoNavigate] KCP transport configured on port {kcpTransport.Port}");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] Could not find or create KcpTransport!");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] SetupKCPTransport error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Auto-click on Main Menu to load the game.
+        /// </summary>
+        private static void TryAutoClickMainMenu()
+        {
+            try
+            {
+                // GHOST HOST MODE: If we have a save path configured, load it directly
+                // This is more reliable than trying to click menu buttons
+                if (!string.IsNullOrEmpty(Plugin.AutoLoadSave.Value) || Plugin.AutoLoadSlot.Value >= 0)
+                {
+                    Plugin.DebugLog("[AutoNavigate] Have save configured, loading directly via FlowManager...");
+                    TryAutoLoadDirect();
+                    _mainMenuHandled = true;
+                    _lastAutoClickTime = Time.realtimeSinceStartup;
+                    return;
+                }
+
+                // Fall back to menu button clicking if no save configured
+                // Find MainMenuUI
+                var mainMenuUIType = AccessTools.TypeByName("MainMenuUI");
+                if (mainMenuUIType == null) return;
+
+                var instanceField = mainMenuUIType.GetField("instance", BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic);
+                var mainMenuUI = instanceField?.GetValue(null);
+                if (mainMenuUI == null) return;
+
+                Plugin.DebugLog("[AutoNavigate] Found MainMenuUI, looking for Continue/Load button...");
+
+                // Try to find and click the Continue button first (if there's a save)
+                var continueMethod = mainMenuUIType.GetMethod("ContinueClicked", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                if (continueMethod != null)
+                {
+                    // Check if continue button is active/interactable
+                    var continueButtonField = mainMenuUIType.GetField("continueButton", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                    var continueButton = continueButtonField?.GetValue(mainMenuUI);
+
+                    if (continueButton != null)
+                    {
+                        // Check if button is interactable
+                        var interactableProp = continueButton.GetType().GetProperty("interactable");
+                        bool isInteractable = interactableProp != null && (bool)interactableProp.GetValue(continueButton);
+
+                        if (isInteractable)
+                        {
+                            Plugin.DebugLog("[AutoNavigate] Clicking Continue button...");
+                            continueMethod.Invoke(mainMenuUI, null);
+                            _mainMenuHandled = true;
+                            _lastAutoClickTime = Time.realtimeSinceStartup;
+                            return;
+                        }
+                    }
+                }
+
+                // If no continue, try Load Game button
+                var loadGameMethod = mainMenuUIType.GetMethod("LoadGameClicked", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                if (loadGameMethod != null)
+                {
+                    Plugin.DebugLog("[AutoNavigate] Clicking Load Game button...");
+                    loadGameMethod.Invoke(mainMenuUI, null);
+                    _mainMenuHandled = true;
+                    _lastAutoClickTime = Time.realtimeSinceStartup;
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.DebugLog($"[AutoNavigate] MainMenu error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Bypass the "press any key to continue" loading screen prompt.
+        /// </summary>
+        private static void TryBypassLoadingPrompt()
+        {
+            try
+            {
+                string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+                // Start monitoring when we enter Loading scene
+                if (currentScene == "Loading" && !_loadingSceneMonitorActive)
+                {
+                    _loadingSceneMonitorActive = true;
+                    _loadingSceneEnteredTime = Time.realtimeSinceStartup;
+                    Plugin.DebugLog("[AutoNavigate] Entered Loading scene, starting monitor...");
+                }
+
+                // If we've left the Loading scene, stop monitoring
+                if (currentScene != "Loading" && _loadingSceneMonitorActive)
+                {
+                    _loadingSceneMonitorActive = false;
+                    _forcedLoadingCompletion = false;
+                    Plugin.DebugLog($"[AutoNavigate] Left Loading scene, now on: {currentScene}");
+                    return;
+                }
+
+                if (!_loadingSceneMonitorActive) return;
+
+                // Find LoadingUI
+                var loadingUIType = AccessTools.TypeByName("LoadingUI");
+                if (loadingUIType == null) return;
+
+                var instanceField = loadingUIType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var loadingUI = instanceField?.GetValue(null);
+                if (loadingUI == null) return;
+
+                // Check current state
+                var loadedField = loadingUIType.GetField("_loaded", BindingFlags.NonPublic | BindingFlags.Instance);
+                var confirmedField = loadingUIType.GetField("confirmedLoad", BindingFlags.Public | BindingFlags.Instance);
+
+                if (loadedField == null || confirmedField == null) return;
+
+                bool isLoaded = (bool)loadedField.GetValue(loadingUI);
+                bool isConfirmed = (bool)confirmedField.GetValue(loadingUI);
+
+                // If loaded but not confirmed, bypass prompt immediately
+                if (isLoaded && !isConfirmed)
+                {
+                    Plugin.DebugLog("[AutoNavigate] Loading complete, bypassing 'press any key' prompt...");
+                    ForceLoadingCompletion(loadingUIType, loadingUI, loadedField, confirmedField);
+                    return;
+                }
+
+                // TIMEOUT-BASED FORCE COMPLETION: If stuck on Loading scene too long, force it
+                float timeOnLoadingScene = Time.realtimeSinceStartup - _loadingSceneEnteredTime;
+                if (timeOnLoadingScene >= LOADING_TIMEOUT_SECONDS && !_forcedLoadingCompletion)
+                {
+                    Plugin.DebugLog($"[AutoNavigate] TIMEOUT! Stuck on Loading for {timeOnLoadingScene:F1}s - forcing completion!");
+                    ForceLoadingCompletion(loadingUIType, loadingUI, loadedField, confirmedField);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Only log periodically
+                if (_updateCallCount % 300 == 0)
+                {
+                    Plugin.DebugLog($"[AutoNavigate] Loading prompt error: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Force loading to complete by setting all necessary flags.
+        /// This is called either when loading is done or after timeout.
+        /// </summary>
+        private static void ForceLoadingCompletion(Type loadingUIType, object loadingUI, FieldInfo loadedField, FieldInfo confirmedField)
+        {
+            try
+            {
+                _forcedLoadingCompletion = true;
+
+                // Set _loaded = true
+                loadedField.SetValue(loadingUI, true);
+                Plugin.Log.LogInfo("[AutoNavigate] Set _loaded = true");
+
+                // Set confirmedLoad = true
+                confirmedField.SetValue(loadingUI, true);
+                Plugin.Log.LogInfo("[AutoNavigate] Set confirmedLoad = true");
+
+                // Call OnFinishLoading to complete the transition
+                var onFinishMethod = loadingUIType.GetMethod("OnFinishLoading", BindingFlags.Public | BindingFlags.Instance);
+                if (onFinishMethod != null)
+                {
+                    onFinishMethod.Invoke(loadingUI, null);
+                    Plugin.Log.LogInfo("[AutoNavigate] Called LoadingUI.OnFinishLoading()");
+                }
+
+                // Also try to call DJManager.instance.OnFinishInit() which is done in the Update
+                var djManagerType = AccessTools.TypeByName("DJManager");
+                if (djManagerType != null)
+                {
+                    var djInstance = djManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                    if (djInstance != null)
+                    {
+                        var onFinishInit = djManagerType.GetMethod("OnFinishInit", BindingFlags.Public | BindingFlags.Instance);
+                        onFinishInit?.Invoke(djInstance, null);
+                        Plugin.Log.LogInfo("[AutoNavigate] Called DJManager.OnFinishInit()");
+                    }
+                }
+
+                _loadingPromptHandled = true;
+                _lastAutoClickTime = Time.realtimeSinceStartup;
+                Plugin.Log.LogInfo("[AutoNavigate] Loading completion forced successfully!");
+
+                // Try to force-load the required game scenes if they haven't loaded
+                TryForceLoadGameScenes();
+            }
+            catch (Exception ex)
+            {
+                Plugin.DebugLog($"[AutoNavigate] ForceLoadingCompletion error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Try to force-load the game scenes that the FlowManager coroutine failed to load.
+        /// </summary>
+        private static void TryForceLoadGameScenes()
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[AutoNavigate] Attempting to force-load game scenes...");
+
+                // Check which scenes are loaded
+                int sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                bool hasPlayerScene = false;
+                bool hasVoxelandScene = false;
+                bool hasUIScene = false;
+
+                for (int i = 0; i < sceneCount; i++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    Plugin.Log.LogInfo($"[AutoNavigate] Scene {i}: {scene.name} (loaded={scene.isLoaded})");
+
+                    if (scene.name == "Player Scene" && scene.isLoaded) hasPlayerScene = true;
+                    if (scene.name == "Voxeland Scene" && scene.isLoaded) hasVoxelandScene = true;
+                    if (scene.name == "UI" && scene.isLoaded) hasUIScene = true;
+                }
+
+                // Try to load missing scenes additively using SYNCHRONOUS loading
+                // Async loading doesn't work properly in Wine/headless mode
+                if (!hasPlayerScene)
+                {
+                    Plugin.Log.LogInfo("[AutoNavigate] Loading Player Scene (SYNC)...");
+                    try
+                    {
+                        UnityEngine.SceneManagement.SceneManager.LoadScene("Player Scene", UnityEngine.SceneManagement.LoadSceneMode.Additive);
+                        Plugin.Log.LogInfo("[AutoNavigate] Player Scene loaded!");
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.LogError($"[AutoNavigate] Player Scene load failed: {ex.Message}");
+                    }
+                }
+
+                if (!hasVoxelandScene)
+                {
+                    Plugin.Log.LogInfo("[AutoNavigate] Loading Voxeland Scene (SYNC)...");
+                    try
+                    {
+                        UnityEngine.SceneManagement.SceneManager.LoadScene("Voxeland Scene", UnityEngine.SceneManagement.LoadSceneMode.Additive);
+                        Plugin.Log.LogInfo("[AutoNavigate] Voxeland Scene loaded!");
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.LogError($"[AutoNavigate] Voxeland Scene load failed: {ex.Message}");
+                    }
+                }
+
+                if (!hasUIScene)
+                {
+                    Plugin.Log.LogInfo("[AutoNavigate] Loading UI scene (SYNC)...");
+                    try
+                    {
+                        UnityEngine.SceneManagement.SceneManager.LoadScene("UI", UnityEngine.SceneManagement.LoadSceneMode.Additive);
+                        Plugin.Log.LogInfo("[AutoNavigate] UI Scene loaded!");
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.LogError($"[AutoNavigate] UI Scene load failed: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoNavigate] TryForceLoadGameScenes error: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Attempt to force scene loading if FlowManager's coroutine failed.
+        /// This tries to help Unity's async operations complete.
+        /// </summary>
+        private static void TryForceSceneLoad()
+        {
+            if (_forceLoadedScenes) return;
+            _forceLoadedScenes = true;
+
+            Plugin.DebugLog("[AutoLoad] Attempting to help scene loading complete...");
+
+            try
+            {
+                // Keep time scale at 1
+                Time.timeScale = 1f;
+
+                // Check if there are pending async operations
+                int sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                Plugin.DebugLog($"[AutoLoad] Current scene count: {sceneCount}");
+                for (int i = 0; i < sceneCount; i++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    Plugin.DebugLog($"[AutoLoad]   - {scene.name} (isLoaded={scene.isLoaded}, isValid={scene.IsValid()})");
+
+                    // Try to set any valid game scene as active
+                    if (scene.isLoaded && scene.name != "Main Menu" && scene.name != "Loading")
+                    {
+                        Plugin.DebugLog($"[AutoLoad] Setting {scene.name} as active scene...");
+                        UnityEngine.SceneManagement.SceneManager.SetActiveScene(scene);
+                    }
+                }
+
+                // Try to force LoadingUI to skip the "press any key" prompt
+                TryBypassLoadingPrompts();
+
+                // Try to initialize GameState and MachineManager
+                TryInitializeGameSystems();
+            }
+            catch (Exception ex)
+            {
+                Plugin.DebugLog($"[AutoLoad] Force scene load error: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Try to bypass loading prompts that require user input
+        /// </summary>
+        private static void TryBypassLoadingPrompts()
+        {
+            Plugin.DebugLog("[AutoLoad] Attempting to bypass loading prompts...");
+
+            try
+            {
+                // Find InputHandler and simulate input
+                var inputHandlerType = AccessTools.TypeByName("InputHandler");
+                if (inputHandlerType != null)
+                {
+                    var instanceField = inputHandlerType.GetField("instance",
+                        BindingFlags.Public | BindingFlags.Static);
+                    var inputHandler = instanceField?.GetValue(null);
+
+                    if (inputHandler != null)
+                    {
+                        // Try to set anyInputPressed
+                        var anyInputField = inputHandlerType.GetField("anyInputPressed",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (anyInputField != null)
+                        {
+                            anyInputField.SetValue(inputHandler, true);
+                            Plugin.DebugLog("[AutoLoad] Set InputHandler.anyInputPressed = true");
+                        }
+
+                        // Also try AnyInputPressed property
+                        var anyInputProp = inputHandlerType.GetProperty("AnyInputPressed",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (anyInputProp != null)
+                        {
+                            Plugin.DebugLog($"[AutoLoad] InputHandler.AnyInputPressed = {anyInputProp.GetValue(inputHandler)}");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.DebugLog("[AutoLoad] InputHandler.instance is NULL");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.DebugLog($"[AutoLoad] Bypass loading prompts error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Try to initialize game systems after scene load
+        /// </summary>
+        private static void TryInitializeGameSystems()
+        {
+            Plugin.DebugLog("[AutoLoad] Attempting to initialize game systems...");
+
+            try
+            {
+                // Find GameState
+                var gameStateType = AccessTools.TypeByName("GameState");
+                if (gameStateType != null)
+                {
+                    var instanceField = gameStateType.GetField("instance",
+                        BindingFlags.Public | BindingFlags.Static);
+                    var gameState = instanceField?.GetValue(null);
+                    Plugin.DebugLog($"[AutoLoad] GameState.instance: {(gameState != null ? "exists" : "NULL")}");
+                }
+
+                // Find MachineManager
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var instanceField = machineManagerType.GetField("instance",
+                        BindingFlags.Public | BindingFlags.Static);
+                    var machineManager = instanceField?.GetValue(null);
+                    Plugin.DebugLog($"[AutoLoad] MachineManager.instance: {(machineManager != null ? "exists" : "NULL")}");
+                }
+
+                // Find LoadingUI and force it to complete
+                var loadingUIType = AccessTools.TypeByName("LoadingUI");
+                if (loadingUIType != null)
+                {
+                    var instanceField = loadingUIType.GetField("instance",
+                        BindingFlags.Public | BindingFlags.Static);
+                    var loadingUI = instanceField?.GetValue(null);
+
+                    if (loadingUI != null)
+                    {
+                        Plugin.DebugLog("[AutoLoad] Found LoadingUI.instance, forcing completion...");
+
+                        // Set _loaded = true
+                        var loadedField = loadingUIType.GetField("_loaded",
+                            BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (loadedField != null)
+                        {
+                            loadedField.SetValue(loadingUI, true);
+                            Plugin.DebugLog("[AutoLoad] Set LoadingUI._loaded = true");
+                        }
+
+                        // Set confirmedLoad = true
+                        var confirmedField = loadingUIType.GetField("confirmedLoad",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (confirmedField != null)
+                        {
+                            confirmedField.SetValue(loadingUI, true);
+                            Plugin.DebugLog("[AutoLoad] Set LoadingUI.confirmedLoad = true");
+                        }
+
+                        // Call OnFinishLoading
+                        var onFinishMethod = loadingUIType.GetMethod("OnFinishLoading",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (onFinishMethod != null)
+                        {
+                            onFinishMethod.Invoke(loadingUI, null);
+                            Plugin.DebugLog("[AutoLoad] Called LoadingUI.OnFinishLoading()");
+                        }
+
+                        // Call DismissLoadingScreen
+                        var dismissMethod = loadingUIType.GetMethod("DismissLoadingScreen",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (dismissMethod != null)
+                        {
+                            dismissMethod.Invoke(loadingUI, null);
+                            Plugin.DebugLog("[AutoLoad] Called LoadingUI.DismissLoadingScreen()");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.DebugLog("[AutoLoad] LoadingUI.instance is NULL");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.DebugLog($"[AutoLoad] Game systems init error: {ex}");
             }
         }
 
@@ -270,6 +1108,14 @@ namespace TechtonicaDedicatedServer.Networking
                 loadSaveGameMethod.Invoke(null, new object[] { saveState, null, false });
                 Plugin.DebugLog("[AutoLoad-Direct] LoadSaveGame called successfully!");
 
+                // CRITICAL: The game sets Time.timeScale = 0 during loading which can freeze coroutines
+                // We need to reset it to allow the loading coroutine to progress
+                if (Time.timeScale < 0.01f)
+                {
+                    Plugin.DebugLog("[AutoLoad-Direct] Time.timeScale was 0, resetting to 1 to allow loading...");
+                    Time.timeScale = 1f;
+                }
+
                 // CRITICAL: Set SaveState.saveOpStatus to SaveSucceeded
                 // This is required for SendSaveString coroutine to send save data to clients
                 // Without this, clients get stuck on "Getting Save File From Host"
@@ -299,10 +1145,9 @@ namespace TechtonicaDedicatedServer.Networking
                     Plugin.DebugLog($"[AutoLoad-Direct] WARNING: Failed to set saveOpStatus: {statusEx.Message}");
                 }
 
-                // Now we need to start the server after a delay
-                // Use a flag that the main thread Update loop will check
-                Plugin.DebugLog("[AutoLoad-Direct] Scheduling server start in 15 seconds...");
-                _serverStartScheduledTime = Time.realtimeSinceStartup + 15f;
+                // Start the server after a short delay (no scene loading needed in headless mode)
+                Plugin.DebugLog("[AutoLoad-Direct] Scheduling server start in 5 seconds...");
+                _serverStartScheduledTime = Time.realtimeSinceStartup + 5f;
                 _serverStartPending = true;
             }
             catch (Exception ex)

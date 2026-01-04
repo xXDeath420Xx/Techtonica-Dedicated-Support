@@ -41,17 +41,33 @@ namespace TechtonicaDedicatedServer.Patches
 
                 // Patch NetworkedPlayer and ThirdPersonDisplayAnimator to prevent null refs in dedicated server mode
                 PatchNetworkedPlayer(harmony);
+                PatchPlayerCrafting(harmony);
                 PatchThirdPersonDisplayAnimator(harmony);
 
                 // CRITICAL: Patch TheVegetationEngine to prevent graphics errors in headless mode
                 PatchTVEGlobalVolume(harmony);
 
+                // GHOST HOST MODE: Patch InputHandler to simulate input for loading prompts
+                PatchInputHandler(harmony);
+
                 // CRITICAL: Patch TechNetworkManager.Awake to skip FizzyFacepunch (Steam) transport creation
                 // This frees up port 6968 for our KCP transport
                 PatchTechNetworkManager(harmony);
 
+                // CRITICAL: Patch TechNetworkManager.OnServerAddPlayer to handle headless mode
+                PatchTechNetworkManagerOnServerAddPlayer(harmony);
+
                 // CRITICAL: Patch SaveState.PrepSave to handle null references in headless mode
                 PatchSaveState(harmony);
+
+                // CRITICAL: Patch FlowManager's scene loading to work in headless mode
+                PatchFlowManagerSceneLoading(harmony);
+
+                // CRITICAL: Patch AddressablesManager to skip async loading waits in headless mode
+                PatchAddressablesManager(harmony);
+
+                // CRITICAL: Patch NetworkMessageRelay to handle network actions in headless mode
+                PatchNetworkMessageRelay(harmony);
 
                 _patchesApplied = true;
                 Plugin.Log.LogInfo("[HeadlessPatches] Headless patches applied");
@@ -361,11 +377,244 @@ namespace TechtonicaDedicatedServer.Patches
                     harmony.Patch(updateMethod, prefix: prefix);
                     Plugin.Log.LogInfo("[HeadlessPatches] NetworkedPlayer.Update patched to skip");
                 }
+
+                // Patch OnStartServer with prefix (let it run) and finalizer (catch errors)
+                var onStartServerMethod = AccessTools.Method(networkedPlayerType, "OnStartServer");
+                if (onStartServerMethod != null)
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Found OnStartServer: {onStartServerMethod.DeclaringType.Name}.{onStartServerMethod.Name}");
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkedPlayer_OnStartServer_Prefix));
+                    var finalizer = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkedPlayer_OnStartServer_Finalizer));
+                    harmony.Patch(onStartServerMethod, prefix: prefix, finalizer: finalizer);
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkedPlayer.OnStartServer patched with error handling");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] OnStartServer method not found on NetworkedPlayer!");
+                    // Try to list all methods to see what's available
+                    var allMethods = networkedPlayerType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                    foreach (var m in allMethods)
+                    {
+                        if (m.Name.Contains("Start") || m.Name.Contains("Server"))
+                        {
+                            Plugin.Log.LogInfo($"[HeadlessPatches]   Method: {m.DeclaringType.Name}.{m.Name}");
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogWarning($"[HeadlessPatches] NetworkedPlayer patch failed: {ex.Message}");
             }
+        }
+
+        // Prefix to handle OnStartServer - allow it to run but catch errors
+        private static bool NetworkedPlayer_OnStartServer_Prefix(object __instance)
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[HeadlessPatches] NetworkedPlayer.OnStartServer called - letting it run with error handling");
+                // Allow original to run - we'll patch PlayerCrafting.Init separately
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] NetworkedPlayer.OnStartServer error (ignored): {ex.Message}");
+                return false;
+            }
+        }
+
+        // Finalizer to catch any exceptions from OnStartServer
+        public static Exception NetworkedPlayer_OnStartServer_Finalizer(Exception __exception, object __instance)
+        {
+            if (__exception != null)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] NetworkedPlayer.OnStartServer exception caught: {__exception.Message}");
+                // Suppress the exception - let the server continue
+            }
+
+            // CRITICAL: Ensure player is registered in allPlayers even if OnStartServer had issues
+            try
+            {
+                EnsurePlayerRegistered(__instance);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] Failed to ensure player registration: {ex.Message}");
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Ensures a NetworkedPlayer is registered in GameState.instance.allPlayers.
+        /// This is critical for NetworkMessageRelay.GetPlayer() to find the player when handling commands.
+        /// </summary>
+        private static void EnsurePlayerRegistered(object networkedPlayer)
+        {
+            if (networkedPlayer == null) return;
+
+            try
+            {
+                // Get the NetworkID from the player
+                var networkedPlayerType = networkedPlayer.GetType();
+                var networkIdProp = networkedPlayerType.GetProperty("NetworkID", BindingFlags.Public | BindingFlags.Instance);
+                if (networkIdProp == null)
+                {
+                    networkIdProp = networkedPlayerType.GetProperty("NetworkNetworkID", BindingFlags.Public | BindingFlags.Instance);
+                }
+
+                string networkId = null;
+                if (networkIdProp != null)
+                {
+                    networkId = networkIdProp.GetValue(networkedPlayer) as string;
+                }
+
+                if (string.IsNullOrEmpty(networkId))
+                {
+                    // Try to get from connectionToClient.authenticationData
+                    var connectionField = networkedPlayerType.GetProperty("connectionToClient", BindingFlags.Public | BindingFlags.Instance);
+                    if (connectionField != null)
+                    {
+                        var connection = connectionField.GetValue(networkedPlayer);
+                        if (connection != null)
+                        {
+                            var authDataProp = connection.GetType().GetProperty("authenticationData");
+                            if (authDataProp != null)
+                            {
+                                networkId = authDataProp.GetValue(connection) as string;
+                            }
+                        }
+                    }
+                }
+
+                if (string.IsNullOrEmpty(networkId))
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] Could not determine player NetworkID for registration");
+                    return;
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] Player NetworkID: {networkId}");
+
+                // Get GameState.instance
+                var gameStateType = AccessTools.TypeByName("GameState");
+                if (gameStateType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] GameState type not found for player registration");
+                    return;
+                }
+
+                var instanceProp = gameStateType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                if (instanceProp == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] GameState.instance property not found");
+                    return;
+                }
+
+                var gameStateInstance = instanceProp.GetValue(null);
+                if (gameStateInstance == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] GameState.instance is NULL - cannot register player");
+                    return;
+                }
+
+                // Get allPlayers dictionary
+                var allPlayersField = gameStateType.GetField("allPlayers", BindingFlags.Public | BindingFlags.Instance);
+                if (allPlayersField == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] GameState.allPlayers field not found");
+                    return;
+                }
+
+                var allPlayers = allPlayersField.GetValue(gameStateInstance);
+                if (allPlayers == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] GameState.allPlayers is NULL");
+                    return;
+                }
+
+                // allPlayers is Dictionary<string, NetworkedPlayer>
+                var dictType = allPlayers.GetType();
+                var containsKeyMethod = dictType.GetMethod("ContainsKey");
+                var addMethod = dictType.GetMethod("set_Item");
+
+                bool alreadyRegistered = (bool)containsKeyMethod.Invoke(allPlayers, new object[] { networkId });
+                if (!alreadyRegistered)
+                {
+                    addMethod.Invoke(allPlayers, new object[] { networkId, networkedPlayer });
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Registered player '{networkId}' in GameState.allPlayers");
+                }
+                else
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Player '{networkId}' already registered in GameState.allPlayers");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] Error registering player: {ex.Message}");
+            }
+        }
+
+        private static void PatchPlayerCrafting(Harmony harmony)
+        {
+            try
+            {
+                var playerCraftingType = AccessTools.TypeByName("PlayerCrafting");
+                if (playerCraftingType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] PlayerCrafting type not found");
+                    return;
+                }
+
+                // Patch Init method to handle headless mode
+                var initMethod = AccessTools.Method(playerCraftingType, "Init");
+                if (initMethod != null)
+                {
+                    var finalizer = new HarmonyMethod(typeof(HeadlessPatches), nameof(PlayerCrafting_Init_Finalizer));
+                    harmony.Patch(initMethod, finalizer: finalizer);
+                    Plugin.Log.LogInfo("[HeadlessPatches] PlayerCrafting.Init patched with finalizer");
+                }
+
+                // Also patch any methods that might throw when InventoryWrapper is null
+                var craftMethods = playerCraftingType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                foreach (var method in craftMethods)
+                {
+                    if (method.Name.Contains("Craft") || method.Name.Contains("Add") || method.Name.Contains("Remove"))
+                    {
+                        try
+                        {
+                            var finalizer = new HarmonyMethod(typeof(HeadlessPatches), nameof(PlayerCrafting_Method_Finalizer));
+                            harmony.Patch(method, finalizer: finalizer);
+                        }
+                        catch { }
+                    }
+                }
+                Plugin.Log.LogInfo("[HeadlessPatches] PlayerCrafting methods patched");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] PlayerCrafting patch failed: {ex.Message}");
+            }
+        }
+
+        public static Exception PlayerCrafting_Init_Finalizer(Exception __exception)
+        {
+            if (__exception != null)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] PlayerCrafting.Init exception caught (headless mode): {__exception.Message}");
+                return null; // Suppress
+            }
+            return null;
+        }
+
+        public static Exception PlayerCrafting_Method_Finalizer(Exception __exception)
+        {
+            if (__exception != null)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] PlayerCrafting method exception: {__exception.Message}");
+                return null; // Suppress
+            }
+            return null;
         }
 
         private static void PatchThirdPersonDisplayAnimator(Harmony harmony)
@@ -436,6 +685,417 @@ namespace TechtonicaDedicatedServer.Patches
             {
                 Plugin.Log.LogWarning($"[HeadlessPatches] TechNetworkManager patch failed: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Patch FlowManager's scene loading to work in headless mode.
+        /// Unity's async scene loading doesn't complete properly in Wine headless mode.
+        /// We bypass the scene loading coroutine and start the server directly.
+        /// </summary>
+        private static void PatchFlowManagerSceneLoading(Harmony harmony)
+        {
+            try
+            {
+                var flowManagerType = AccessTools.TypeByName("FlowManager");
+                if (flowManagerType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] FlowManager type not found");
+                    return;
+                }
+
+                Plugin.Log.LogInfo("[HeadlessPatches] Found FlowManager type, patching scene loading...");
+
+                // Patch the LoadScreenCoroutine's state machine (MoveNext method)
+                // The coroutine is compiled into a nested class like <LoadScreenCoroutine>d__XX
+                foreach (var nestedType in flowManagerType.GetNestedTypes(BindingFlags.NonPublic))
+                {
+                    if (nestedType.Name.Contains("LoadScreenCoroutine"))
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Found coroutine type: {nestedType.Name}");
+
+                        var moveNextMethod = nestedType.GetMethod("MoveNext",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                        if (moveNextMethod != null)
+                        {
+                            Plugin.Log.LogInfo("[HeadlessPatches] Found LoadScreenCoroutine.MoveNext");
+                            var moveNextPostfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadScreenCoroutine_MoveNext_Postfix));
+                            harmony.Patch(moveNextMethod, postfix: moveNextPostfix);
+                            Plugin.Log.LogInfo("[HeadlessPatches] LoadScreenCoroutine.MoveNext patched (postfix)");
+                        }
+                        break;
+                    }
+                }
+
+                // Patch LoadingUI.confirmedLoad to always return true in headless mode
+                var loadingUIType = AccessTools.TypeByName("LoadingUI");
+                if (loadingUIType != null)
+                {
+                    // Try to patch the confirmedLoad field getter if it's a property
+                    var confirmedLoadProp = loadingUIType.GetProperty("confirmedLoad",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    if (confirmedLoadProp != null && confirmedLoadProp.GetMethod != null)
+                    {
+                        var confirmedLoadPostfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadingUI_ConfirmedLoad_Postfix));
+                        harmony.Patch(confirmedLoadProp.GetMethod, postfix: confirmedLoadPostfix);
+                        Plugin.Log.LogInfo("[HeadlessPatches] LoadingUI.confirmedLoad getter patched");
+                    }
+
+                    // Patch LoadingUI.OnFinishLoading to complete loading faster
+                    var onFinishMethod = loadingUIType.GetMethod("OnFinishLoading",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (onFinishMethod != null)
+                    {
+                        var onFinishPostfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadingUI_OnFinishLoading_Postfix));
+                        harmony.Patch(onFinishMethod, postfix: onFinishPostfix);
+                        Plugin.Log.LogInfo("[HeadlessPatches] LoadingUI.OnFinishLoading patched");
+                    }
+                }
+
+                // Patch AsyncOperation to force completion in headless mode
+                // This is a key fix - Unity's async operations don't complete in Wine
+                PatchAsyncOperations(harmony);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] FlowManager scene loading patch failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Patch AsyncOperation to force progress completion in headless mode.
+        /// Unity's async scene loading gets stuck at 0.9 progress in Wine.
+        /// </summary>
+        private static void PatchAsyncOperations(Harmony harmony)
+        {
+            try
+            {
+                // Patch SceneManager.LoadSceneAsync to return pre-completed operations
+                var sceneManagerType = typeof(UnityEngine.SceneManagement.SceneManager);
+
+                // Get all LoadSceneAsync overloads
+                var loadSceneAsyncMethods = sceneManagerType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .Where(m => m.Name == "LoadSceneAsync");
+
+                foreach (var method in loadSceneAsyncMethods)
+                {
+                    try
+                    {
+                        var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadSceneAsync_Postfix));
+                        harmony.Patch(method, postfix: postfix);
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Patched SceneManager.LoadSceneAsync ({method.GetParameters().Length} params)");
+                    }
+                    catch (Exception patchEx)
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] Failed to patch LoadSceneAsync: {patchEx.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] AsyncOperation patch failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Postfix for LoadScreenCoroutine.MoveNext - force scene loading completion in headless mode
+        /// </summary>
+        public static void LoadScreenCoroutine_MoveNext_Postfix(object __instance, ref bool __result)
+        {
+            if (!Plugin.HeadlessMode.Value) return;
+
+            try
+            {
+                // The coroutine state machine has a <>1__state field
+                var stateType = __instance.GetType();
+                var stateField = stateType.GetField("<>1__state", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (stateField != null)
+                {
+                    int state = (int)stateField.GetValue(__instance);
+
+                    // Log state transitions (only first few times to avoid spam)
+                    if (state >= 0 && state < 10)
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] LoadScreenCoroutine state: {state}");
+                    }
+
+                    // If coroutine is taking too long (state > 5), try to force completion
+                    if (state > 5)
+                    {
+                        ForceSceneLoadingCompletion();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] LoadScreenCoroutine_MoveNext_Postfix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Force scene loading to complete in headless mode
+        /// </summary>
+        private static void ForceSceneLoadingCompletion()
+        {
+            try
+            {
+                // Set Time.timeScale to 1 to allow coroutines to progress
+                Time.timeScale = 1f;
+
+                // Try to set FlowManager.isTransitioning = false
+                var flowManagerType = AccessTools.TypeByName("FlowManager");
+                if (flowManagerType != null)
+                {
+                    var isTransitioningField = flowManagerType.GetField("isTransitioning",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+
+                    if (isTransitioningField != null)
+                    {
+                        bool currentValue = (bool)isTransitioningField.GetValue(null);
+                        if (currentValue)
+                        {
+                            Plugin.Log.LogInfo("[HeadlessPatches] Forcing FlowManager.isTransitioning = false");
+                            isTransitioningField.SetValue(null, false);
+                        }
+                    }
+                }
+
+                // Try to complete LoadingUI
+                var loadingUIType = AccessTools.TypeByName("LoadingUI");
+                if (loadingUIType != null)
+                {
+                    var instanceField = loadingUIType.GetField("instance",
+                        BindingFlags.Public | BindingFlags.Static);
+                    var loadingUI = instanceField?.GetValue(null);
+
+                    if (loadingUI != null)
+                    {
+                        // Set confirmedLoad = true
+                        var confirmedLoadField = loadingUIType.GetField("confirmedLoad",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (confirmedLoadField != null)
+                        {
+                            confirmedLoadField.SetValue(loadingUI, true);
+                            Plugin.Log.LogInfo("[HeadlessPatches] Set LoadingUI.confirmedLoad = true");
+                        }
+
+                        // Set _loaded = true
+                        var loadedField = loadingUIType.GetField("_loaded",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (loadedField != null)
+                        {
+                            loadedField.SetValue(loadingUI, true);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] ForceSceneLoadingCompletion error: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Postfix for LoadingUI.confirmedLoad - return true in headless mode to skip "press any key"
+        /// </summary>
+        public static void LoadingUI_ConfirmedLoad_Postfix(ref bool __result)
+        {
+            if (Plugin.HeadlessMode.Value)
+            {
+                __result = true;
+            }
+        }
+
+        /// <summary>
+        /// Postfix for LoadingUI.OnFinishLoading - force loading complete in headless mode
+        /// </summary>
+        public static void LoadingUI_OnFinishLoading_Postfix(object __instance)
+        {
+            if (!Plugin.HeadlessMode.Value) return;
+
+            try
+            {
+                // Force confirmedLoad = true
+                var loadingUIType = __instance.GetType();
+                var confirmedLoadField = loadingUIType.GetField("confirmedLoad",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (confirmedLoadField != null)
+                {
+                    confirmedLoadField.SetValue(__instance, true);
+                    Plugin.Log.LogInfo("[HeadlessPatches] LoadingUI.OnFinishLoading - set confirmedLoad = true");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] LoadingUI_OnFinishLoading_Postfix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Postfix for SceneManager.LoadSceneAsync - force async operation to complete in headless mode
+        /// </summary>
+        public static void LoadSceneAsync_Postfix(ref AsyncOperation __result)
+        {
+            if (!Plugin.HeadlessMode.Value) return;
+            if (__result == null) return;
+
+            try
+            {
+                // Force allowSceneActivation to true
+                __result.allowSceneActivation = true;
+
+                // Log the scene loading
+                Plugin.Log.LogInfo($"[HeadlessPatches] LoadSceneAsync called - forcing allowSceneActivation = true");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] LoadSceneAsync_Postfix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Patch AddressablesManager.IsLoaded to always return true in headless mode.
+        /// Unity Addressables async loading doesn't complete properly in Wine headless mode.
+        /// This allows FlowManager's LoadScreenCoroutine to proceed.
+        /// </summary>
+        private static void PatchAddressablesManager(Harmony harmony)
+        {
+            try
+            {
+                var addressablesManagerType = AccessTools.TypeByName("AddressablesManager");
+                if (addressablesManagerType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] AddressablesManager type not found");
+                    return;
+                }
+
+                // Patch IsLoaded method to always return true
+                var isLoadedMethod = addressablesManagerType.GetMethod("IsLoaded",
+                    BindingFlags.Public | BindingFlags.Instance);
+
+                if (isLoadedMethod != null)
+                {
+                    var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(AddressablesManager_IsLoaded_Postfix));
+                    harmony.Patch(isLoadedMethod, postfix: postfix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] AddressablesManager.IsLoaded patched");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] AddressablesManager.IsLoaded method not found");
+                }
+
+                // Also patch the Loaded property on AddressableLoadHandle
+                var loadHandleType = addressablesManagerType.GetNestedType("AddressableLoadHandle",
+                    BindingFlags.Public | BindingFlags.NonPublic);
+                if (loadHandleType != null)
+                {
+                    var loadedGetter = loadHandleType.GetProperty("Loaded", BindingFlags.Public | BindingFlags.Instance)?.GetGetMethod();
+                    if (loadedGetter != null)
+                    {
+                        var loadedPostfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(AddressableLoadHandle_Loaded_Postfix));
+                        harmony.Patch(loadedGetter, postfix: loadedPostfix);
+                        Plugin.Log.LogInfo("[HeadlessPatches] AddressableLoadHandle.Loaded patched");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] AddressablesManager patch failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Postfix for AddressablesManager.IsLoaded - always return true
+        /// </summary>
+        public static void AddressablesManager_IsLoaded_Postfix(ref bool __result)
+        {
+            if (!Plugin.HeadlessMode.Value) return;
+            __result = true;
+        }
+
+        /// <summary>
+        /// Postfix for AddressableLoadHandle.Loaded - always return true
+        /// </summary>
+        public static void AddressableLoadHandle_Loaded_Postfix(ref bool __result)
+        {
+            if (!Plugin.HeadlessMode.Value) return;
+            __result = true;
+        }
+
+        /// <summary>
+        /// GHOST HOST MODE: Patch InputHandler to always report key presses.
+        /// This allows bypassing "press any key to continue" prompts during loading.
+        /// </summary>
+        private static void PatchInputHandler(Harmony harmony)
+        {
+            try
+            {
+                var inputHandlerType = AccessTools.TypeByName("InputHandler");
+                if (inputHandlerType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] InputHandler type not found");
+                    return;
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] Found InputHandler type, patching AnyInputPressed...");
+
+                // Find AnyInputPressed property getter
+                var anyInputPressedProp = inputHandlerType.GetProperty("AnyInputPressed",
+                    BindingFlags.Public | BindingFlags.Instance);
+
+                if (anyInputPressedProp != null && anyInputPressedProp.GetMethod != null)
+                {
+                    var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(AnyInputPressed_Postfix));
+                    harmony.Patch(anyInputPressedProp.GetMethod, postfix: postfix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] Patched InputHandler.AnyInputPressed to return true");
+                }
+                else
+                {
+                    // Try anyInputPressed field
+                    Plugin.Log.LogInfo("[HeadlessPatches] AnyInputPressed property not found, trying field...");
+                }
+
+                // Also patch any GetKeyDown or GetButtonDown methods if they exist
+                foreach (var method in inputHandlerType.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic))
+                {
+                    if (method.Name == "GetKeyDown" || method.Name == "GetAnyKey" || method.Name == "WasAnyInputPressed")
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Found {method.Name}, patching...");
+                        try
+                        {
+                            var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(ReturnTrue_Postfix));
+                            harmony.Patch(method, postfix: postfix);
+                            Plugin.Log.LogInfo($"[HeadlessPatches] Patched {method.Name} to return true");
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.LogWarning($"[HeadlessPatches] Failed to patch {method.Name}: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] Failed to patch InputHandler: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Postfix to make AnyInputPressed always return true in headless mode.
+        /// </summary>
+        public static void AnyInputPressed_Postfix(ref bool __result)
+        {
+            __result = true;
+        }
+
+        /// <summary>
+        /// Generic postfix to make any bool method return true.
+        /// </summary>
+        public static void ReturnTrue_Postfix(ref bool __result)
+        {
+            __result = true;
         }
 
         private static void PatchTVEGlobalVolume(Harmony harmony)
@@ -1231,6 +1891,88 @@ namespace TechtonicaDedicatedServer.Patches
         }
 
         /// <summary>
+        /// Patches TechNetworkManager.OnServerAddPlayer to handle headless mode.
+        /// The original throws NullReferenceException because game systems aren't initialized.
+        /// </summary>
+        private static void PatchTechNetworkManagerOnServerAddPlayer(Harmony harmony)
+        {
+            Plugin.Log.LogInfo("[HeadlessPatches] PatchTechNetworkManagerOnServerAddPlayer starting...");
+            try
+            {
+                var techNetworkManagerType = AccessTools.TypeByName("TechNetworkManager");
+                if (techNetworkManagerType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] TechNetworkManager type not found for OnServerAddPlayer patch");
+                    return;
+                }
+
+                var onServerAddPlayerMethod = AccessTools.Method(techNetworkManagerType, "OnServerAddPlayer");
+                if (onServerAddPlayerMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(TechNetworkManager_OnServerAddPlayer_Prefix));
+                    harmony.Patch(onServerAddPlayerMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] TechNetworkManager.OnServerAddPlayer patched");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] TechNetworkManager.OnServerAddPlayer method not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] TechNetworkManager.OnServerAddPlayer patch failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Prefix for TechNetworkManager.OnServerAddPlayer - handles player spawning in headless mode.
+        /// Original method signature: public override void OnServerAddPlayer(NetworkConnection conn)
+        /// </summary>
+        public static bool TechNetworkManager_OnServerAddPlayer_Prefix(object __instance, NetworkConnection conn)
+        {
+            // Log immediately at the very start
+            Plugin.Log.LogInfo($"[HeadlessPatches] === TechNetworkManager.OnServerAddPlayer PREFIX CALLED === conn={conn?.connectionId}");
+
+            try
+            {
+                // Cast instance to NetworkManager
+                var networkManager = __instance as NetworkManager;
+                if (networkManager == null)
+                {
+                    Plugin.Log.LogError("[HeadlessPatches] __instance is not a NetworkManager!");
+                    return false;
+                }
+
+                // Get the player prefab from the NetworkManager
+                var playerPrefab = networkManager.playerPrefab;
+                if (playerPrefab == null)
+                {
+                    Plugin.Log.LogError("[HeadlessPatches] Player prefab is null!");
+                    return false;
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] Found player prefab: {playerPrefab.name}");
+
+                // Instantiate the player
+                var player = GameObject.Instantiate(playerPrefab);
+                player.name = $"NetworkedPlayer_Server_{conn.connectionId}";
+                Plugin.Log.LogInfo($"[HeadlessPatches] Instantiated player: {player.name}");
+
+                // Add player to connection
+                NetworkServer.AddPlayerForConnection(conn, player);
+                Plugin.Log.LogInfo($"[HeadlessPatches] Spawned player for connection {conn.connectionId}: {player.name}");
+
+                return false; // Skip original - we handled it
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] OnServerAddPlayer error: {ex.Message}");
+                Plugin.Log.LogError($"[HeadlessPatches] Stack: {ex.StackTrace}");
+                return false; // Skip original to prevent crash
+            }
+        }
+
+        /// <summary>
         /// Postfix for TechNetworkManager.Awake - Destroy FizzyFacepunch after it's created.
         /// The original Awake creates FizzyFacepunch which may bind to ports.
         /// We destroy it immediately and let DirectConnectManager set up KCP transport instead.
@@ -1323,6 +2065,247 @@ namespace TechtonicaDedicatedServer.Patches
             else
             {
                 Plugin.Log.LogInfo("[HeadlessPatches] No transport found on NetworkManager");
+            }
+        }
+
+        /// <summary>
+        /// Patches NetworkMessageRelay to handle network actions in headless mode.
+        /// The relay needs to process SimTick requests and network actions for item pickup, crafting, etc.
+        /// </summary>
+        private static void PatchNetworkMessageRelay(Harmony harmony)
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[HeadlessPatches] Looking for NetworkMessageRelay type...");
+
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    // Try searching all assemblies
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay not found by name, searching assemblies...");
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        try
+                        {
+                            var types = asm.GetTypes().Where(t => t.Name == "NetworkMessageRelay");
+                            foreach (var t in types)
+                            {
+                                relayType = t;
+                                Plugin.Log.LogInfo($"[HeadlessPatches] Found NetworkMessageRelay in {asm.GetName().Name}");
+                                break;
+                            }
+                        }
+                        catch { }
+                        if (relayType != null) break;
+                    }
+                }
+
+                if (relayType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] NetworkMessageRelay type not found in any assembly");
+                    return;
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] Found NetworkMessageRelay type: {relayType.FullName}");
+
+                // List all methods to understand the relay
+                var allMethods = relayType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                foreach (var m in allMethods)
+                {
+                    if (m.Name.Contains("SimTick") || m.Name.Contains("Action") || m.Name.Contains("Cmd") || m.Name.Contains("Rpc"))
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] NetworkMessageRelay method: {m.Name}");
+                    }
+                }
+
+                // Patch SendNetworkAction to handle actions in headless mode
+                var sendActionMethod = AccessTools.Method(relayType, "SendNetworkAction");
+                if (sendActionMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_SendNetworkAction_Prefix));
+                    harmony.Patch(sendActionMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.SendNetworkAction patched");
+                }
+
+                // Patch CmdSendNetworkAction (server-side command handler)
+                var cmdSendActionMethod = AccessTools.Method(relayType, "CmdSendNetworkAction");
+                if (cmdSendActionMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_CmdSendNetworkAction_Prefix));
+                    harmony.Patch(cmdSendActionMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.CmdSendNetworkAction patched");
+                }
+
+                // Patch UserCode_CmdSendNetworkAction (actual handler)
+                var userCodeMethod = AccessTools.Method(relayType, "UserCode_CmdSendNetworkAction");
+                if (userCodeMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_UserCode_CmdSendNetworkAction_Prefix));
+                    harmony.Patch(userCodeMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.UserCode_CmdSendNetworkAction patched");
+                }
+
+                // Patch UserCode_RequestCurrentSimTick - the SERVER-SIDE handler
+                // RequestCurrentSimTick is the client-side stub that sends the command
+                // UserCode_RequestCurrentSimTick is what processes it on the server
+                var userCodeSimTickMethod = AccessTools.Method(relayType, "UserCode_RequestCurrentSimTick");
+                if (userCodeSimTickMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_RequestCurrentSimTick_Prefix));
+                    harmony.Patch(userCodeSimTickMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.UserCode_RequestCurrentSimTick patched");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] UserCode_RequestCurrentSimTick not found!");
+                }
+
+                Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay patches applied");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] NetworkMessageRelay patch failed: {ex}");
+            }
+        }
+
+        // Stored sim tick from save data
+        private static long _currentSimTick = 724189; // Default from save
+
+        /// <summary>
+        /// Sets the current sim tick from loaded save data
+        /// </summary>
+        public static void SetCurrentSimTick(long tick)
+        {
+            _currentSimTick = tick;
+            Plugin.Log.LogInfo($"[HeadlessPatches] Set current sim tick to {tick}");
+        }
+
+        /// <summary>
+        /// Prefix for NetworkMessageRelay.SendNetworkAction - logs and allows action processing
+        /// </summary>
+        public static bool NetworkMessageRelay_SendNetworkAction_Prefix(object action)
+        {
+            try
+            {
+                var actionType = action?.GetType().Name ?? "null";
+                Plugin.Log.LogInfo($"[HeadlessPatches] SendNetworkAction called with: {actionType}");
+                // Allow original to run - it will send to server
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] SendNetworkAction error: {ex.Message}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prefix for NetworkMessageRelay.CmdSendNetworkAction - server receives action from client
+        /// </summary>
+        public static bool NetworkMessageRelay_CmdSendNetworkAction_Prefix(object __instance, object action)
+        {
+            try
+            {
+                var actionType = action?.GetType().Name ?? "null";
+                Plugin.Log.LogInfo($"[HeadlessPatches] CmdSendNetworkAction received: {actionType}");
+
+                // Try to execute the action directly
+                if (action != null)
+                {
+                    var executeMethod = action.GetType().GetMethod("Execute",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (executeMethod != null)
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Executing action: {actionType}");
+                        executeMethod.Invoke(action, null);
+                        return false; // Skip original - we handled it
+                    }
+                }
+                return true; // Run original if we couldn't handle
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] CmdSendNetworkAction error: {ex.Message}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prefix for NetworkMessageRelay.UserCode_CmdSendNetworkAction - actual server handler
+        /// </summary>
+        public static bool NetworkMessageRelay_UserCode_CmdSendNetworkAction_Prefix(object __instance, object action)
+        {
+            try
+            {
+                var actionType = action?.GetType().Name ?? "null";
+                Plugin.Log.LogInfo($"[HeadlessPatches] UserCode_CmdSendNetworkAction: {actionType}");
+
+                // Try to execute the action
+                if (action != null)
+                {
+                    var executeMethod = action.GetType().GetMethod("Execute",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (executeMethod != null)
+                    {
+                        try
+                        {
+                            Plugin.Log.LogInfo($"[HeadlessPatches] Executing action via UserCode: {actionType}");
+                            executeMethod.Invoke(action, null);
+                        }
+                        catch (Exception execEx)
+                        {
+                            Plugin.Log.LogWarning($"[HeadlessPatches] Action execute failed: {execEx.Message}");
+                        }
+                    }
+                }
+                return true; // Allow original to continue (for RPC relay to clients)
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] UserCode_CmdSendNetworkAction error: {ex.Message}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prefix for NetworkMessageRelay.RequestCurrentSimTick - handles sim tick request and sends response.
+        /// The original UserCode_RequestCurrentSimTick does:
+        ///   GetPlayer(sender, out var _).SetPlayerFinishedLoading();
+        ///   FactorySimManager.instance.lastSyncTick = MachineManager.instance.curTick;
+        ///   ProcessCurrentSimTick(sender, MachineManager.instance.curTick);
+        /// We need to call ProcessCurrentSimTick to respond to the client.
+        /// </summary>
+        public static bool NetworkMessageRelay_RequestCurrentSimTick_Prefix(
+            object __instance,
+            NetworkConnectionToClient sender)
+        {
+            try
+            {
+                Plugin.Log.LogInfo($"[HeadlessPatches] RequestCurrentSimTick from conn={sender?.connectionId}, tick={_currentSimTick}");
+
+                // Try to find the ProcessCurrentSimTick method to respond to client
+                var relayType = __instance.GetType();
+                var processMethod = relayType.GetMethod("ProcessCurrentSimTick",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (processMethod != null && sender != null)
+                {
+                    // Call ProcessCurrentSimTick(sender, tick) to send response to client
+                    processMethod.Invoke(__instance, new object[] { sender, (int)_currentSimTick });
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Sent ProcessCurrentSimTick({_currentSimTick}) to connection {sender.connectionId}");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] Cannot send ProcessCurrentSimTick - method={processMethod != null}, sender={sender != null}");
+                }
+
+                // Skip original - we handled it
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] RequestCurrentSimTick error: {ex.Message}");
+                return false; // Skip original to prevent crash
             }
         }
     }

@@ -706,11 +706,24 @@ namespace TechtonicaDedicatedServer.Networking
         {
             _tickCount++;
 
+            // Log first few ticks and periodically to debug transport
+            if (_tickCount <= 3 || (_tickCount % 500 == 0))
+            {
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] TickTransport #{_tickCount}, NetworkServer.active={NetworkServer.active}, Transport.activeTransport={Mirror.Transport.activeTransport?.GetType().Name ?? "NULL"}");
+            }
+
             // Only tick when server is active
             if (!NetworkServer.active) return;
 
             var transport = Mirror.Transport.activeTransport;
-            if (transport == null) return;
+            if (transport == null)
+            {
+                if (_tickCount <= 3)
+                {
+                    Plugin.Log.LogWarning("[ServerConnectionHandler] TickTransport: Transport.activeTransport is NULL!");
+                }
+                return;
+            }
 
             // Log first tick with detailed info
             if (_tickCount == 1)
