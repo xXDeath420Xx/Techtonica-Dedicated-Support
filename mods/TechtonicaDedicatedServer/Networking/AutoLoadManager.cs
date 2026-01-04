@@ -464,6 +464,15 @@ namespace TechtonicaDedicatedServer.Networking
                     // Set port
                     kcpTransport.Port = (ushort)Plugin.ServerPort.Value;
 
+                    // CRITICAL: Set DualMode = false to fix Wine socket issues
+                    // This forces IPv4 only which works properly in Wine
+                    kcpTransport.DualMode = false;
+                    kcpTransport.NoDelay = true;
+                    kcpTransport.Interval = 10;
+                    kcpTransport.Timeout = 10000;
+
+                    Plugin.Log.LogInfo($"[AutoNavigate] KCP configured: Port={kcpTransport.Port}, DualMode={kcpTransport.DualMode}");
+
                     // Set as the active transport
                     Mirror.Transport.activeTransport = kcpTransport;
 
