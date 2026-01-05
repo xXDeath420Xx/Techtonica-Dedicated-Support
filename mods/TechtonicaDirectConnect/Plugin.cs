@@ -1060,7 +1060,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.49";
+        public const string PLUGIN_VERSION = "1.0.50";
     }
 
     /// <summary>
@@ -1517,6 +1517,43 @@ namespace TechtonicaDirectConnect
         /// </summary>
         public static bool RequestCurrentSimTick_Prefix(object __instance)
         {
+            // Add detailed debug logging to understand SendCommandInternal failures
+            try
+            {
+                var behaviour = __instance as NetworkBehaviour;
+                var identity = behaviour?.netIdentity;
+
+                Plugin.Log.LogInfo($"[DirectConnect] RequestCurrentSimTick DEBUG:");
+                Plugin.Log.LogInfo($"[DirectConnect]   __instance != null: {__instance != null}");
+                Plugin.Log.LogInfo($"[DirectConnect]   As NetworkBehaviour: {behaviour != null}");
+                Plugin.Log.LogInfo($"[DirectConnect]   netIdentity: {identity != null}");
+
+                if (identity != null)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect]   netId: {identity.netId}");
+                    Plugin.Log.LogInfo($"[DirectConnect]   isClient: {identity.isClient}");
+                    Plugin.Log.LogInfo($"[DirectConnect]   isServer: {identity.isServer}");
+                    Plugin.Log.LogInfo($"[DirectConnect]   hasAuthority: {identity.hasAuthority}");
+                    Plugin.Log.LogInfo($"[DirectConnect]   connectionToServer: {identity.connectionToServer != null}");
+                    if (identity.connectionToServer != null)
+                    {
+                        Plugin.Log.LogInfo($"[DirectConnect]   connectionToServer.isReady: {identity.connectionToServer.isReady}");
+                    }
+                }
+
+                Plugin.Log.LogInfo($"[DirectConnect]   NetworkClient.active: {NetworkClient.active}");
+                Plugin.Log.LogInfo($"[DirectConnect]   NetworkClient.isConnected: {NetworkClient.isConnected}");
+                Plugin.Log.LogInfo($"[DirectConnect]   NetworkClient.connection: {NetworkClient.connection != null}");
+                if (NetworkClient.connection != null)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect]   NetworkClient.connection.isReady: {NetworkClient.connection.isReady}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[DirectConnect] RequestCurrentSimTick debug logging error: {ex.Message}");
+            }
+
             if (__instance == null)
             {
                 Plugin.Log.LogWarning("[DirectConnect] RequestCurrentSimTick called on null instance - dedicated server mode?");
@@ -1524,6 +1561,10 @@ namespace TechtonicaDirectConnect
                 TryCallOnFinishLoading();
                 return false; // Skip original method
             }
+
+            // NOTE: Server now proactively pushes tick, so even if this command fails,
+            // the client will receive tick via ProcessCurrentSimTick
+            Plugin.Log.LogInfo("[DirectConnect] RequestCurrentSimTick proceeding to original method...");
             return true; // Run original method
         }
 

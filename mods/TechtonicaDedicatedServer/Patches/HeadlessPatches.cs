@@ -1962,6 +1962,11 @@ namespace TechtonicaDedicatedServer.Patches
                 NetworkServer.AddPlayerForConnection(conn, player);
                 Plugin.Log.LogInfo($"[HeadlessPatches] Spawned player for connection {conn.connectionId}: {player.name}");
 
+                // CRITICAL: Proactively send tick to new client
+                // Client's RequestCurrentSimTick command fails due to Mirror internal state issues
+                // So we push the tick immediately when they connect
+                ProactivelySendTickToClient(conn as NetworkConnectionToClient);
+
                 return false; // Skip original - we handled it
             }
             catch (Exception ex)
@@ -1969,6 +1974,93 @@ namespace TechtonicaDedicatedServer.Patches
                 Plugin.Log.LogError($"[HeadlessPatches] OnServerAddPlayer error: {ex.Message}");
                 Plugin.Log.LogError($"[HeadlessPatches] Stack: {ex.StackTrace}");
                 return false; // Skip original to prevent crash
+            }
+        }
+
+        /// <summary>
+        /// Proactively sends the current sim tick to a newly connected client.
+        /// This bypasses the broken client->server RequestCurrentSimTick command flow.
+        /// </summary>
+        private static void ProactivelySendTickToClient(NetworkConnectionToClient conn)
+        {
+            if (conn == null)
+            {
+                Plugin.Log.LogWarning("[HeadlessPatches] ProactivelySendTickToClient: conn is null");
+                return;
+            }
+
+            try
+            {
+                // Get the current tick from MachineManager if available
+                int tickToSend = (int)_currentSimTick;
+
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var instanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        var mmInstance = instanceField.GetValue(null);
+                        if (mmInstance != null)
+                        {
+                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            if (curTickField != null)
+                            {
+                                tickToSend = (int)curTickField.GetValue(mmInstance);
+                            }
+                        }
+                    }
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] ProactivelySendTickToClient: Sending tick {tickToSend} to connection {conn.connectionId}");
+
+                // Get NetworkMessageRelay.instance
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] ProactivelySendTickToClient: NetworkMessageRelay type not found");
+                    return;
+                }
+
+                var instanceProp = relayType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                object relayInstance = null;
+                if (instanceProp != null)
+                {
+                    relayInstance = instanceProp.GetValue(null);
+                }
+                else
+                {
+                    // Try as field
+                    var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        relayInstance = instanceField.GetValue(null);
+                    }
+                }
+
+                if (relayInstance == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] ProactivelySendTickToClient: NetworkMessageRelay.instance is null");
+                    return;
+                }
+
+                // Get ProcessCurrentSimTick method
+                var processMethod = relayType.GetMethod("ProcessCurrentSimTick",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (processMethod == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] ProactivelySendTickToClient: ProcessCurrentSimTick method not found");
+                    return;
+                }
+
+                // Call ProcessCurrentSimTick(conn, tick) to send tick to client
+                processMethod.Invoke(relayInstance, new object[] { conn, tickToSend });
+                Plugin.Log.LogInfo($"[HeadlessPatches] ProactivelySendTickToClient: Successfully sent tick {tickToSend} to client {conn.connectionId}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] ProactivelySendTickToClient error: {ex.Message}");
             }
         }
 

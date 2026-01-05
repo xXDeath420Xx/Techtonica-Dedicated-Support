@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.50
+- **FIX**: Server now proactively pushes tick to new clients on connect
+- This bypasses the broken client->server RequestCurrentSimTick command flow
+- Added detailed debug logging for NetworkIdentity state in RequestCurrentSimTick
+- Server's HeadlessPatches now calls ProactivelySendTickToClient when player joins
+- **These fixes should enable game interactions (pickup, mine, build, craft)**
+
 ## 1.0.49
 - **FIX**: connectionToServer is a PROPERTY not a field - use GetSetMethod(true) for internal setter
 - This should finally allow commands to be sent to the server
