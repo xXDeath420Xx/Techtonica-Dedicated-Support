@@ -4,7 +4,7 @@ schemaVersion = "0.0.1"
 [package]
 namespace = "CertiFried"
 name = "TechtonicaDirectConnect"
-versionNumber = "1.0.44"
+versionNumber = "1.0.48"
 description = "Connect to Techtonica dedicated servers via direct IP. Bypass Steam lobbies and join 24/7 community servers!"
 websiteUrl = "https://github.com/xXDeath420Xx/Techtonica"
 containsNsfwContent = false

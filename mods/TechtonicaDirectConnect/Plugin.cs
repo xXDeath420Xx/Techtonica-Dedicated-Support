@@ -399,8 +399,8 @@ namespace TechtonicaDirectConnect
         }
 
         /// <summary>
-        /// Creates a dummy NetworkMessageRelay instance if one doesn't exist.
-        /// This prevents NullReferenceException when FlowManager tries to call RequestCurrentSimTick.
+        /// Ensures NetworkMessageRelay instance exists by finding a scene relay or creating a dummy.
+        /// Prefers scene relays with NetworkIdentity for proper network communication.
         /// </summary>
         private void EnsureNetworkMessageRelayExists()
         {
@@ -417,29 +417,44 @@ namespace TechtonicaDirectConnect
                 var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
                 if (instanceField == null)
                 {
-                    // Try property
-                    var instanceProp = relayType.GetProperty("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                    if (instanceProp != null)
-                    {
-                        var existing = instanceProp.GetValue(null);
-                        if (existing != null)
-                        {
-                            Log.LogInfo("[DirectConnect] NetworkMessageRelay.instance already exists");
-                            return;
-                        }
-                    }
-                    Log.LogWarning("[DirectConnect] Could not find NetworkMessageRelay.instance field/property");
+                    Log.LogWarning("[DirectConnect] Could not find NetworkMessageRelay.instance field");
                     return;
                 }
 
                 var existingInstance = instanceField.GetValue(null);
                 if (existingInstance != null)
                 {
-                    Log.LogInfo("[DirectConnect] NetworkMessageRelay.instance already exists");
+                    // Check if it has NetworkIdentity
+                    var existingMB = existingInstance as MonoBehaviour;
+                    var hasNetId = existingMB?.GetComponent<NetworkIdentity>() != null;
+                    Log.LogInfo($"[DirectConnect] NetworkMessageRelay.instance already exists (hasNetworkIdentity={hasNetId})");
                     return;
                 }
 
-                // Create a dummy instance - it's a MonoBehaviour so we need a GameObject
+                // Try to find an existing NetworkMessageRelay in the scene (preferred - has proper NetworkIdentity)
+                var sceneRelays = UnityEngine.Object.FindObjectsOfType(relayType);
+                Log.LogInfo($"[DirectConnect] Found {sceneRelays.Length} NetworkMessageRelay objects in scene");
+
+                foreach (var relay in sceneRelays)
+                {
+                    var mb = relay as MonoBehaviour;
+                    if (mb != null)
+                    {
+                        var netId = mb.GetComponent<NetworkIdentity>();
+                        Log.LogInfo($"[DirectConnect] Found relay: {mb.name}, hasNetworkIdentity={netId != null}, netId={netId?.netId ?? 0}");
+
+                        if (netId != null)
+                        {
+                            // Use this scene relay - it has proper networking
+                            instanceField.SetValue(null, relay);
+                            Log.LogInfo($"[DirectConnect] Using scene NetworkMessageRelay with netId {netId.netId}");
+                            return;
+                        }
+                    }
+                }
+
+                // No networked scene relay found - create a dummy (won't be able to send commands properly)
+                Log.LogWarning("[DirectConnect] No networked scene relay found - creating dummy (commands may not work!)");
                 var dummyGO = new GameObject("DirectConnect_DummyNetworkMessageRelay");
                 DontDestroyOnLoad(dummyGO);
                 var dummyRelay = dummyGO.AddComponent(relayType);
@@ -927,6 +942,7 @@ namespace TechtonicaDirectConnect
             {
                 NetworkManager.singleton?.StopClient();
                 DisableDirectConnect();
+                NetworkRelayLinkingPatches.Reset(); // Reset linking state for next connection
                 _statusMessage = "Disconnected";
                 Log.LogInfo("[DirectConnect] Disconnected");
             }
@@ -978,11 +994,12 @@ namespace TechtonicaDirectConnect
                     _kcpTransport = transportGO.AddComponent<KcpTransport>();
                 }
 
-                // Configure KCP
+                // Configure KCP - MUST match server settings
                 _kcpTransport.Port = (ushort)port;
                 _kcpTransport.NoDelay = true;
                 _kcpTransport.Interval = 10;
                 _kcpTransport.Timeout = 10000;
+                _kcpTransport.DualMode = false; // IPv4 only - MUST match server
 
                 // Swap transport
                 transportField.SetValue(networkManager, _kcpTransport);
@@ -1043,7 +1060,222 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.44";
+        public const string PLUGIN_VERSION = "1.0.48";
+    }
+
+    /// <summary>
+    /// Patches to link client's scene NetworkMessageRelay to server's dynamic relay netId.
+    /// This is CRITICAL for Commands to work - Mirror routes Commands by netId.
+    /// Server creates dynamic relay (netId 1), client has scene relay (different netId).
+    /// We intercept spawn messages and link them so Commands route properly.
+    /// </summary>
+    [HarmonyPatch]
+    public static class NetworkRelayLinkingPatches
+    {
+        private static bool _relayLinked = false;
+        private static bool _loggedOnce = false;
+
+        /// <summary>
+        /// Reset linking state when disconnecting
+        /// </summary>
+        public static void Reset()
+        {
+            _relayLinked = false;
+            _loggedOnce = false;
+        }
+
+        /// <summary>
+        /// Patch NetworkClient.OnSpawn to intercept spawn messages.
+        /// When we see a spawn with no assetId/sceneId (the server's dynamic relay),
+        /// we link our scene relay to that netId so Commands route properly.
+        /// Returns false to skip original method when we handle the spawn ourselves.
+        /// </summary>
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(NetworkClient), "OnSpawn")]
+        public static bool OnSpawn_Prefix(SpawnMessage message)
+        {
+            // Check if this spawn will fail (no assetId, no sceneId)
+            // This is likely the server's dynamic NetworkMessageRelay
+            if (message.assetId == Guid.Empty && message.sceneId == 0)
+            {
+                if (!_loggedOnce)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] Intercepted spawn for netId {message.netId} with no assetId/sceneId - will try to link scene relay");
+                    _loggedOnce = true;
+                }
+
+                // Only try to link once per session
+                if (!_relayLinked)
+                {
+                    // Try to link our scene NetworkMessageRelay to this netId
+                    if (LinkSceneRelayToNetId(message.netId))
+                    {
+                        _relayLinked = true;
+                        // Skip original method - we handled it
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Already linked, skip this spawn to avoid error
+                    return false;
+                }
+            }
+
+            // Let original method run for other spawns
+            return true;
+        }
+
+        /// <summary>
+        /// Links the client's scene NetworkMessageRelay to the server's netId.
+        /// This makes Commands from the client use the correct netId that the server expects.
+        /// If no scene relay exists, creates one with NetworkIdentity and links it.
+        /// </summary>
+        private static bool LinkSceneRelayToNetId(uint targetNetId)
+        {
+            try
+            {
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Plugin.Log.LogWarning("[DirectConnect] NetworkMessageRelay type not found");
+                    return false;
+                }
+
+                // Find scene NetworkMessageRelay with NetworkIdentity
+                var sceneRelays = UnityEngine.Object.FindObjectsOfType(relayType);
+                Plugin.Log.LogInfo($"[DirectConnect] Found {sceneRelays.Length} NetworkMessageRelay objects in scene");
+
+                NetworkIdentity identity = null;
+                object relay = null;
+
+                foreach (var existingRelay in sceneRelays)
+                {
+                    var mb = existingRelay as MonoBehaviour;
+                    if (mb == null) continue;
+
+                    identity = mb.GetComponent<NetworkIdentity>();
+                    if (identity != null)
+                    {
+                        relay = existingRelay;
+                        Plugin.Log.LogInfo($"[DirectConnect] Found scene relay '{mb.name}' with identity");
+                        break;
+                    }
+                    else
+                    {
+                        Plugin.Log.LogInfo($"[DirectConnect] Relay '{mb.name}' has no NetworkIdentity");
+                    }
+                }
+
+                // If no scene relay with NetworkIdentity found, CREATE one
+                if (relay == null || identity == null)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] No scene relay found - creating networked relay for netId {targetNetId}");
+
+                    var relayGO = new GameObject("DirectConnect_NetworkMessageRelay");
+                    GameObject.DontDestroyOnLoad(relayGO);
+
+                    // Add NetworkIdentity FIRST
+                    identity = relayGO.AddComponent<NetworkIdentity>();
+
+                    // Add the relay component
+                    relay = relayGO.AddComponent(relayType);
+
+                    Plugin.Log.LogInfo($"[DirectConnect] Created NetworkMessageRelay with NetworkIdentity");
+                }
+
+                // Link it to the server's netId
+                Plugin.Log.LogInfo($"[DirectConnect] Linking relay to netId {targetNetId}");
+
+                // Set the netId using reflection (it has internal setter)
+                bool netIdSet = false;
+                var netIdField = typeof(NetworkIdentity).GetField("_netId", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (netIdField == null)
+                {
+                    netIdField = typeof(NetworkIdentity).GetField("netId", BindingFlags.NonPublic | BindingFlags.Instance);
+                }
+
+                if (netIdField != null)
+                {
+                    netIdField.SetValue(identity, targetNetId);
+                    Plugin.Log.LogInfo($"[DirectConnect] Set identity._netId = {targetNetId} via field");
+                    netIdSet = true;
+                }
+                else
+                {
+                    // Try property with reflection
+                    var netIdProp = typeof(NetworkIdentity).GetProperty("netId", BindingFlags.Public | BindingFlags.Instance);
+                    if (netIdProp != null)
+                    {
+                        var setter = netIdProp.GetSetMethod(true);
+                        if (setter != null)
+                        {
+                            setter.Invoke(identity, new object[] { targetNetId });
+                            Plugin.Log.LogInfo($"[DirectConnect] Set identity.netId = {targetNetId} via property setter");
+                            netIdSet = true;
+                        }
+                    }
+                }
+
+                if (!netIdSet)
+                {
+                    Plugin.Log.LogError($"[DirectConnect] Could not set netId on identity!");
+                    return false;
+                }
+
+                // Add to spawned dictionary so Mirror can find it for Commands
+                if (!NetworkClient.spawned.ContainsKey(targetNetId))
+                {
+                    NetworkClient.spawned[targetNetId] = identity;
+                    Plugin.Log.LogInfo($"[DirectConnect] Added identity to NetworkClient.spawned[{targetNetId}]");
+                }
+
+                // Set the static instance field on NetworkMessageRelay
+                var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (instanceField != null)
+                {
+                    instanceField.SetValue(null, relay);
+                    Plugin.Log.LogInfo($"[DirectConnect] Set NetworkMessageRelay.instance");
+                }
+
+                // Mark as client-side object
+                var isClientField = typeof(NetworkIdentity).GetField("isClient", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (isClientField != null)
+                {
+                    isClientField.SetValue(identity, true);
+                }
+
+                // Also try to set hasAuthority for client-owned commands
+                var hasAuthorityField = typeof(NetworkIdentity).GetField("_hasAuthority", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (hasAuthorityField != null)
+                {
+                    hasAuthorityField.SetValue(identity, true);
+                    Plugin.Log.LogInfo($"[DirectConnect] Set hasAuthority = true");
+                }
+
+                // CRITICAL: Set connectionToServer so commands can be sent to server
+                // Without this, SendCommandInternal fails with null reference
+                var connectionToServerField = typeof(NetworkIdentity).GetField("connectionToServer",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (connectionToServerField != null && NetworkClient.connection != null)
+                {
+                    connectionToServerField.SetValue(identity, NetworkClient.connection);
+                    Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer = NetworkClient.connection");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning($"[DirectConnect] Could not set connectionToServer: field={connectionToServerField != null}, connection={NetworkClient.connection != null}");
+                }
+
+                Plugin.Log.LogInfo($"[DirectConnect] Successfully linked NetworkMessageRelay to server's netId {targetNetId}!");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] Failed to link scene relay: {ex}");
+                return false;
+            }
+        }
     }
 
     /// <summary>
@@ -1218,6 +1450,16 @@ namespace TechtonicaDirectConnect
                         harmony.Patch(requestMethod, prefix: prefix, finalizer: finalizer);
                         Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.RequestCurrentSimTick with prefix and finalizer");
                     }
+
+                    // Patch UserCode_ProcessCurrentSimTick - handles server's tick sync response
+                    // FactorySimManager.instance might be null on client
+                    var processMethod = AccessTools.Method(networkRelayType, "UserCode_ProcessCurrentSimTick");
+                    if (processMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(ProcessCurrentSimTick_Prefix));
+                        harmony.Patch(processMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.UserCode_ProcessCurrentSimTick with prefix");
+                    }
                 }
 
                 _patchesApplied = true;
@@ -1280,6 +1522,73 @@ namespace TechtonicaDirectConnect
                 return null; // Suppress the exception
             }
             return __exception;
+        }
+
+        /// <summary>
+        /// Prefix for ProcessCurrentSimTick - handles server's tick sync response.
+        /// The original UserCode_ProcessCurrentSimTick calls:
+        ///   FactorySimManager.instance.HandleServerTimeSync(tick);
+        /// But FactorySimManager.instance might be null on client.
+        /// </summary>
+        public static bool ProcessCurrentSimTick_Prefix(int tick)
+        {
+            try
+            {
+                Plugin.Log.LogInfo($"[DirectConnect] ProcessCurrentSimTick received tick={tick}");
+
+                // Try to call HandleServerTimeSync if FactorySimManager.instance exists
+                var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType != null)
+                {
+                    var instanceProp = factorySimType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceProp != null)
+                    {
+                        var fsmInstance = instanceProp.GetValue(null);
+                        if (fsmInstance != null)
+                        {
+                            var handleMethod = factorySimType.GetMethod("HandleServerTimeSync",
+                                BindingFlags.Public | BindingFlags.Instance);
+                            if (handleMethod != null)
+                            {
+                                handleMethod.Invoke(fsmInstance, new object[] { tick });
+                                Plugin.Log.LogInfo($"[DirectConnect] Successfully synced tick to {tick}");
+                                return false; // Skip original - we handled it
+                            }
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning($"[DirectConnect] FactorySimManager.instance is null - can't sync tick");
+                        }
+                    }
+                }
+
+                // Also try to set MachineManager.instance.curTick if it exists
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var mmInstanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (mmInstanceField != null)
+                    {
+                        var mmInstance = mmInstanceField.GetValue(null);
+                        if (mmInstance != null)
+                        {
+                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            if (curTickField != null)
+                            {
+                                curTickField.SetValue(mmInstance, tick);
+                                Plugin.Log.LogInfo($"[DirectConnect] Set MachineManager.curTick = {tick}");
+                            }
+                        }
+                    }
+                }
+
+                return false; // Skip original to prevent crash
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] ProcessCurrentSimTick error: {ex.Message}");
+                return false; // Skip original to prevent crash
+            }
         }
 
         /// <summary>

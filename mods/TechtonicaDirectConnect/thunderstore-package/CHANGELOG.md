@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.48
+- **FIX**: Set connectionToServer on custom NetworkIdentity for Command routing
+- Without this, SendCommandInternal fails with null reference
+- **FIX**: Patch UserCode_ProcessCurrentSimTick to handle null FactorySimManager
+- Server's tick response now handled gracefully even if game systems aren't initialized
+- Also sets MachineManager.curTick when tick sync is received
+- **These fixes should enable game interactions (pickup, mine, build, craft)**
+
+## 1.0.47
+- **FIX**: Create NetworkMessageRelay with NetworkIdentity if none exists in scene
+- When spawn message arrives before scene loads, now creates a proper relay
+- Links created relay to server's netId (1) for Command routing
+- Sets hasAuthority = true for client-owned commands
+- This should fix interaction (pickup, mine, craft, chest access)
+
+## 1.0.46
+- **FIX**: Added NetworkRelayLinkingPatches to fix Command routing
+- Intercepts spawn messages for server's NetworkMessageRelay (netId 1)
+- Links client's scene relay to server's netId so Commands route properly
+- Skips original OnSpawn to prevent "no AssetId" error
+- Server now spawns NetworkMessageRelay to clients
+
+## 1.0.45
+- **FIX**: KCP transport DualMode mismatch
+- Client now uses DualMode = false (IPv4 only) to match server
+- Fixes "Client KcpTransport DualMode mismatch" connection errors
+
 ## 1.0.44
 - **STATUS: WORKING!** Successfully connecting to dedicated servers!
 - Updated README with correct usage instructions
