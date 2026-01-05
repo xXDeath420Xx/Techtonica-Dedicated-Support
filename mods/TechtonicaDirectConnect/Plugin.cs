@@ -1060,7 +1060,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.48";
+        public const string PLUGIN_VERSION = "1.0.49";
     }
 
     /// <summary>
@@ -1255,16 +1255,34 @@ namespace TechtonicaDirectConnect
 
                 // CRITICAL: Set connectionToServer so commands can be sent to server
                 // Without this, SendCommandInternal fails with null reference
-                var connectionToServerField = typeof(NetworkIdentity).GetField("connectionToServer",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                if (connectionToServerField != null && NetworkClient.connection != null)
+                // connectionToServer is a PROPERTY with internal set, not a field
+                var connectionToServerProp = typeof(NetworkIdentity).GetProperty("connectionToServer",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (connectionToServerProp != null && NetworkClient.connection != null)
                 {
-                    connectionToServerField.SetValue(identity, NetworkClient.connection);
-                    Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer = NetworkClient.connection");
+                    var setter = connectionToServerProp.GetSetMethod(true); // true = get non-public setter
+                    if (setter != null)
+                    {
+                        setter.Invoke(identity, new object[] { NetworkClient.connection });
+                        Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer = NetworkClient.connection (via property)");
+                    }
+                    else
+                    {
+                        // Try direct property set (might work if accessible)
+                        try
+                        {
+                            connectionToServerProp.SetValue(identity, NetworkClient.connection);
+                            Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer = NetworkClient.connection (direct)");
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.LogWarning($"[DirectConnect] Could not set connectionToServer: {ex.Message}");
+                        }
+                    }
                 }
                 else
                 {
-                    Plugin.Log.LogWarning($"[DirectConnect] Could not set connectionToServer: field={connectionToServerField != null}, connection={NetworkClient.connection != null}");
+                    Plugin.Log.LogWarning($"[DirectConnect] Could not set connectionToServer: prop={connectionToServerProp != null}, connection={NetworkClient.connection != null}");
                 }
 
                 Plugin.Log.LogInfo($"[DirectConnect] Successfully linked NetworkMessageRelay to server's netId {targetNetId}!");

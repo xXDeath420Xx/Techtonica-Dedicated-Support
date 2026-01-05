@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.49
+- **FIX**: connectionToServer is a PROPERTY not a field - use GetSetMethod(true) for internal setter
+- This should finally allow commands to be sent to the server
+
 ## 1.0.48
 - **FIX**: Set connectionToServer on custom NetworkIdentity for Command routing
 - Without this, SendCommandInternal fails with null reference
