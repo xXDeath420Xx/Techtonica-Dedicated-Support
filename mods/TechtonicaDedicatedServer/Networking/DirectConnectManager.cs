@@ -101,9 +101,21 @@ namespace TechtonicaDedicatedServer.Networking
         /// </summary>
         public static KcpTransport GetOrCreateKcpTransport()
         {
-            if (_kcpTransport != null) return _kcpTransport;
-
             int port = Plugin.ServerPort.Value;
+
+            // If we have an existing transport, ensure it's ready for use
+            if (_kcpTransport != null)
+            {
+                // Make sure it's enabled
+                if (!_kcpTransport.enabled)
+                {
+                    Plugin.Log.LogInfo("[DirectConnect] Re-enabling existing KCP transport");
+                    _kcpTransport.enabled = true;
+                }
+                // Update port in case it changed
+                _kcpTransport.Port = (ushort)port;
+                return _kcpTransport;
+            }
 
             // Create a new GameObject for our transport
             var transportGO = new GameObject("DirectConnect_KcpTransport");
@@ -677,6 +689,20 @@ namespace TechtonicaDedicatedServer.Networking
                 // Add the NetworkMessageRelay component
                 var relay = relayGO.AddComponent(relayType);
 
+                // CRITICAL: Manually set the netIdentity backing field on the NetworkBehaviour
+                // When adding components at runtime, the caching doesn't happen automatically
+                var netIdentityField = typeof(NetworkBehaviour).GetField("<netIdentity>k__BackingField",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (netIdentityField != null)
+                {
+                    netIdentityField.SetValue(relay, networkIdentity);
+                    Plugin.Log.LogInfo($"[DirectConnect] Set netIdentity backing field on NetworkMessageRelay");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[DirectConnect] Could not find netIdentity backing field!");
+                }
+
                 // Set the static instance field
                 instanceField.SetValue(null, relay);
 
@@ -732,6 +758,13 @@ namespace TechtonicaDedicatedServer.Networking
                 return false;
             }
 
+            // If we already switched to KCP, just return success (don't re-switch)
+            if (_isDirectConnectActive && _kcpTransport != null)
+            {
+                Plugin.Log.LogInfo("[DirectConnect] KCP transport already active, skipping re-initialization");
+                return true;
+            }
+
             try
             {
                 Plugin.Log.LogInfo("[DirectConnect] Looking for NetworkManager.singleton...");
@@ -753,26 +786,31 @@ namespace TechtonicaDedicatedServer.Networking
                     return false;
                 }
 
-                // Store the original transport
-                _originalTransport = transportField.GetValue(networkManager) as Transport;
-
-                // Properly shutdown the original transport to release any resources
-                if (_originalTransport != null)
+                // Store the original transport ONLY if we haven't stored one yet
+                // This prevents us from shutting down our own KCP transport on retry
+                var currentTransport = transportField.GetValue(networkManager) as Transport;
+                if (_originalTransport == null)
                 {
-                    Plugin.Log.LogInfo($"[DirectConnect] Shutting down original transport: {_originalTransport.GetType().Name}");
+                    _originalTransport = currentTransport;
+                }
+
+                // Only shutdown if current transport is NOT our KCP transport
+                if (currentTransport != null && currentTransport != _kcpTransport)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] Shutting down original transport: {currentTransport.GetType().Name}");
                     try
                     {
                         // Try to call Shutdown() if it exists
-                        var shutdownMethod = _originalTransport.GetType().GetMethod("Shutdown",
+                        var shutdownMethod = currentTransport.GetType().GetMethod("Shutdown",
                             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                         if (shutdownMethod != null)
                         {
-                            shutdownMethod.Invoke(_originalTransport, null);
+                            shutdownMethod.Invoke(currentTransport, null);
                             Plugin.Log.LogInfo("[DirectConnect] Original transport Shutdown() called");
                         }
 
                         // Disable the transport component
-                        if (_originalTransport is MonoBehaviour mb)
+                        if (currentTransport is MonoBehaviour mb)
                         {
                             mb.enabled = false;
                             Plugin.Log.LogInfo("[DirectConnect] Original transport disabled");
@@ -782,6 +820,10 @@ namespace TechtonicaDedicatedServer.Networking
                     {
                         Plugin.Log.LogWarning($"[DirectConnect] Error shutting down original transport: {shutdownEx.Message}");
                     }
+                }
+                else if (currentTransport == _kcpTransport)
+                {
+                    Plugin.Log.LogInfo("[DirectConnect] Current transport is already our KCP transport, not shutting down");
                 }
 
                 // Get or create our KCP transport
@@ -1082,6 +1124,31 @@ namespace TechtonicaDedicatedServer.Networking
 
                 Plugin.Log.LogInfo($"[DirectConnect] Host started on port {Plugin.ServerPort.Value}");
                 Plugin.Log.LogInfo($"[DirectConnect] Address: {GetServerAddress()}");
+                Plugin.Log.LogInfo($"[DirectConnect] NetworkServer.active: {NetworkServer.active}");
+                Plugin.Log.LogInfo($"[DirectConnect] Transport.activeTransport: {Transport.activeTransport?.GetType().Name ?? "NULL"}");
+
+                // Check if transport's server is actually active
+                Plugin.Log.LogInfo($"[DirectConnect] Checking _kcpTransport: {(_kcpTransport != null ? "exists" : "NULL")}");
+                if (_kcpTransport != null)
+                {
+                    bool serverActive = _kcpTransport.ServerActive();
+                    Plugin.Log.LogInfo($"[DirectConnect] KcpTransport.ServerActive(): {serverActive}");
+
+                    if (!serverActive)
+                    {
+                        Plugin.Log.LogWarning("[DirectConnect] KCP server not active - socket may not be bound!");
+                        Plugin.Log.LogInfo("[DirectConnect] Attempting explicit ServerStart...");
+                        try
+                        {
+                            _kcpTransport.ServerStart();
+                            Plugin.Log.LogInfo($"[DirectConnect] After explicit ServerStart, ServerActive(): {_kcpTransport.ServerActive()}");
+                        }
+                        catch (Exception startEx)
+                        {
+                            Plugin.Log.LogError($"[DirectConnect] ServerStart failed: {startEx.Message}");
+                        }
+                    }
+                }
 
                 OnServerStarted?.Invoke();
                 OnClientConnected?.Invoke();

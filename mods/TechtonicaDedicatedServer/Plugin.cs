@@ -572,6 +572,9 @@ namespace TechtonicaDedicatedServer
             // Process pending authentication (delayed ServerAccept)
             Networking.DirectConnectManager.ProcessPendingAuth();
 
+            // CRITICAL: Tick network transport from main thread (avoids Wine critical section deadlock)
+            TickNetworkFromMainThread();
+
             // Check if thread triggered auto-load
             if (_threadTriggeredAutoLoad && !_autoLoadStarted)
             {
@@ -652,6 +655,55 @@ namespace TechtonicaDedicatedServer
                 Log.LogInfo("[Hotkey] Server stopped");
             }
         }
+
+        #region Network Ticking (Main Thread)
+
+        private static int _mainThreadNetTickCount = 0;
+        private static int _mainThreadLastConnectionCount = 0;
+
+        /// <summary>
+        /// Tick the network transport from Unity's main thread.
+        /// This avoids Wine's critical section deadlock caused by the background timer.
+        /// </summary>
+        private static void TickNetworkFromMainThread()
+        {
+            if (!Mirror.NetworkServer.active) return;
+
+            var transport = Mirror.Transport.activeTransport;
+            if (transport == null) return;
+
+            _mainThreadNetTickCount++;
+
+            // Log connection count changes
+            int currentConnections = Mirror.NetworkServer.connections.Count;
+            if (currentConnections != _mainThreadLastConnectionCount)
+            {
+                Log.LogInfo($"[Plugin] Connection count changed: {_mainThreadLastConnectionCount} -> {currentConnections}");
+                _mainThreadLastConnectionCount = currentConnections;
+            }
+
+            // Log every 1000 ticks
+            if (_mainThreadNetTickCount % 1000 == 1)
+            {
+                Log.LogInfo($"[Plugin] MainThread net tick #{_mainThreadNetTickCount}, connections={currentConnections}");
+            }
+
+            // Call ServerEarlyUpdate to receive data
+            try
+            {
+                transport.ServerEarlyUpdate();
+            }
+            catch (System.Exception) { }
+
+            // Call ServerLateUpdate to send data
+            try
+            {
+                transport.ServerLateUpdate();
+            }
+            catch (System.Exception) { }
+        }
+
+        #endregion
     }
 
     public static class PluginInfo

@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Threading;
 using UnityEngine;
 
 namespace TechtonicaDedicatedServer.Patches
@@ -44,6 +45,10 @@ namespace TechtonicaDedicatedServer.Patches
                 PatchPlayerCrafting(harmony);
                 PatchThirdPersonDisplayAnimator(harmony);
 
+                // CRITICAL: Patch NetworkTransformBase to prevent position RPC spam from ghost player
+                // This stops the server's ghost player from flooding clients with position updates
+                PatchNetworkTransformForGhostPlayer(harmony);
+
                 // CRITICAL: Patch TheVegetationEngine to prevent graphics errors in headless mode
                 PatchTVEGlobalVolume(harmony);
 
@@ -69,6 +74,16 @@ namespace TechtonicaDedicatedServer.Patches
                 // CRITICAL: Patch NetworkMessageRelay to handle network actions in headless mode
                 PatchNetworkMessageRelay(harmony);
 
+                // CRITICAL: Patch FactorySimManager.SimUpdateAll to handle null Player.instance
+                PatchFactorySimManager(harmony);
+
+                // DISABLED: Background timer causes Wine critical section deadlock
+                // StartSimulationTickTimer();
+                Plugin.Log.LogInfo("[HeadlessPatches] Background timer DISABLED - using Unity callbacks instead");
+
+                // CRITICAL: Patch IPEndPointNonAlloc to handle Wine's incorrect address families
+                PatchIPEndPointNonAlloc(harmony);
+
                 _patchesApplied = true;
                 Plugin.Log.LogInfo("[HeadlessPatches] Headless patches applied");
             }
@@ -77,6 +92,165 @@ namespace TechtonicaDedicatedServer.Patches
                 Plugin.Log.LogError($"[HeadlessPatches] Failed to apply patches: {ex}");
             }
         }
+
+        #region Simulation Tick Timer
+
+        /// <summary>
+        /// Background timer that drives simulation ticks since Unity's Update loop isn't running in headless mode.
+        /// </summary>
+        private static Timer _simulationTimer;
+        private static bool _timerRunning = false;
+        private static DateTime _lastTickTime = DateTime.UtcNow;
+        private static int _timerCallCount = 0;
+
+        /// <summary>
+        /// Starts a background timer that runs the simulation tick every ~15ms (64 ticks/sec).
+        /// This is necessary because Unity's Update() loop doesn't run properly in headless Wine mode.
+        /// </summary>
+        private static void StartSimulationTickTimer()
+        {
+            if (_timerRunning) return;
+
+            try
+            {
+                Plugin.Log.LogInfo("[HeadlessPatches] Starting background simulation tick timer (64 Hz)...");
+
+                // Create a timer that fires every 15ms (~64 Hz)
+                _simulationTimer = new Timer(SimulationTimerCallback, null, 1000, 15);
+                _timerRunning = true;
+
+                Plugin.Log.LogInfo("[HeadlessPatches] Simulation tick timer started!");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] Failed to start simulation timer: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Timer callback that runs the simulation tick.
+        /// </summary>
+        private static void SimulationTimerCallback(object state)
+        {
+            _timerCallCount++;
+
+            try
+            {
+                // Calculate elapsed time since last tick
+                var now = DateTime.UtcNow;
+                float dt = (float)(now - _lastTickTime).TotalSeconds;
+                _lastTickTime = now;
+
+                // Cap dt to prevent huge jumps
+                if (dt > 0.5f) dt = 0.5f;
+                if (dt < 0.001f) dt = 0.015f; // Default to 15ms if too small
+
+                // Log every 1000 calls (~15 seconds)
+                if (_timerCallCount % 1000 == 1)
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] SimTimer #{_timerCallCount}: dt={dt:F4}s, NetworkServer.active={Mirror.NetworkServer.active}");
+                }
+
+                // CRITICAL: Check if server needs to be started (since Unity's Update doesn't run)
+                try
+                {
+                    Networking.AutoLoadManager.CheckServerStartFromTimer();
+                }
+                catch (Exception serverEx)
+                {
+                    if (_timerCallCount % 1000 == 1)
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] Server start check error: {serverEx.Message}");
+                    }
+                }
+
+                // CRITICAL: Tick the network transport to process incoming connections and messages
+                // Since Unity's Update loop isn't running, Mirror won't receive any network events
+                try
+                {
+                    TickNetworkTransport();
+                }
+                catch (Exception netEx)
+                {
+                    if (_timerCallCount % 1000 == 1)
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] Network tick error: {netEx.Message}");
+                    }
+                }
+
+                // Get FactorySimManager.instance
+                var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType == null) return;
+
+                var fsInstanceProp = factorySimType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                var fsInstance = fsInstanceProp?.GetValue(null);
+                if (fsInstance == null) return;
+
+                // Run the simulation tick
+                RunSimulationTick(fsInstance, dt);
+            }
+            catch (Exception ex)
+            {
+                // Log errors occasionally to avoid spam
+                if (_timerCallCount % 1000 == 1)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] SimTimer error: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Tick the network transport to process incoming connections and messages.
+        /// This is needed because Unity's Update loop doesn't run in headless mode.
+        /// </summary>
+        private static int _netTickLogCount = 0;
+        private static int _lastConnectionCount = 0;
+        private static void TickNetworkTransport()
+        {
+            if (!Mirror.NetworkServer.active) return;
+
+            // Get the active transport
+            var transport = Mirror.Transport.activeTransport;
+            if (transport == null) return;
+
+            // Log connection count changes
+            int currentConnections = Mirror.NetworkServer.connections.Count;
+            if (currentConnections != _lastConnectionCount)
+            {
+                Plugin.Log.LogInfo($"[HeadlessPatches] Connection count changed: {_lastConnectionCount} -> {currentConnections}");
+                _lastConnectionCount = currentConnections;
+            }
+
+            // Call ServerEarlyUpdate to receive data
+            try
+            {
+                transport.ServerEarlyUpdate();
+            }
+            catch (Exception ex)
+            {
+                _netTickLogCount++;
+                if (_netTickLogCount % 1000 == 1)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] ServerEarlyUpdate error: {ex.Message}");
+                }
+            }
+
+            // Call ServerLateUpdate to send data
+            try
+            {
+                transport.ServerLateUpdate();
+            }
+            catch (Exception ex)
+            {
+                _netTickLogCount++;
+                if (_netTickLogCount % 1000 == 1)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] ServerLateUpdate error: {ex.Message}");
+                }
+            }
+        }
+
+        #endregion
 
         /// <summary>
         /// Helper to verify a Harmony patch was applied correctly
@@ -653,6 +827,204 @@ namespace TechtonicaDedicatedServer.Patches
         }
 
         /// <summary>
+        /// Patch NetworkTransformBase to prevent position RPC spam from server's ghost player.
+        /// On a dedicated server, the ghost host player isn't moving but NetworkTransformBase
+        /// continuously sends position updates to all clients, flooding them with RPCs.
+        /// This causes KCP dead link detection and disconnects.
+        /// </summary>
+        private static void PatchNetworkTransformForGhostPlayer(Harmony harmony)
+        {
+            try
+            {
+                // Find Mirror's NetworkTransformBase or NetworkTransformReliable
+                var transformTypes = new[] {
+                    "Mirror.NetworkTransformBase",
+                    "Mirror.NetworkTransformReliable",
+                    "Mirror.NetworkTransformUnreliable",
+                    "NetworkTransformBase",
+                    "NetworkTransformReliable"
+                };
+
+                Type transformType = null;
+                foreach (var typeName in transformTypes)
+                {
+                    transformType = AccessTools.TypeByName(typeName);
+                    if (transformType != null)
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Found transform type: {typeName}");
+                        break;
+                    }
+                }
+
+                if (transformType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] NetworkTransformBase type not found - looking for any sync component");
+
+                    // Try to find any component with sync in the name
+                    var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                    foreach (var asm in assemblies)
+                    {
+                        try
+                        {
+                            foreach (var type in asm.GetTypes())
+                            {
+                                if (type.Name.Contains("NetworkTransform") ||
+                                    (type.Name.Contains("Sync") && type.Namespace?.Contains("Mirror") == true))
+                                {
+                                    Plugin.Log.LogInfo($"[HeadlessPatches] Found candidate: {type.FullName}");
+                                    transformType = type;
+                                    break;
+                                }
+                            }
+                        }
+                        catch { }
+                        if (transformType != null) break;
+                    }
+                }
+
+                if (transformType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] No NetworkTransform type found");
+                    return;
+                }
+
+                // Patch the Update or LateUpdate method to skip for server-only (non-client) players
+                var updateMethod = AccessTools.Method(transformType, "Update") ??
+                                   AccessTools.Method(transformType, "LateUpdate");
+
+                if (updateMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkTransformBase_Update_Prefix));
+                    harmony.Patch(updateMethod, prefix: prefix);
+                    Plugin.Log.LogInfo($"[HeadlessPatches] {transformType.Name}.{updateMethod.Name} patched to skip for ghost player");
+                }
+
+                // Also try to patch OnSerialize to prevent sending data
+                var onSerializeMethod = AccessTools.Method(transformType, "OnSerialize");
+                if (onSerializeMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkTransformBase_OnSerialize_Prefix));
+                    harmony.Patch(onSerializeMethod, prefix: prefix);
+                    Plugin.Log.LogInfo($"[HeadlessPatches] {transformType.Name}.OnSerialize patched");
+                }
+
+                // Patch CmdClientToServerSync if it exists (client->server sync)
+                var cmdSyncMethod = AccessTools.Method(transformType, "CmdClientToServerSync");
+                if (cmdSyncMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkTransformBase_CmdSync_Prefix));
+                    harmony.Patch(cmdSyncMethod, prefix: prefix);
+                    Plugin.Log.LogInfo($"[HeadlessPatches] {transformType.Name}.CmdClientToServerSync patched");
+                }
+
+                // Try to patch RpcServerToClientSync (server->client sync) - this is the RPC causing spam
+                var rpcSyncMethod = AccessTools.Method(transformType, "RpcServerToClientSync");
+                if (rpcSyncMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkTransformBase_RpcSync_Prefix));
+                    harmony.Patch(rpcSyncMethod, prefix: prefix);
+                    Plugin.Log.LogInfo($"[HeadlessPatches] {transformType.Name}.RpcServerToClientSync patched");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] NetworkTransform patch failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Prefix for NetworkTransformBase.Update - skip for server's ghost player.
+        /// The ghost player isn't controlled by anyone, so syncing its position is pointless.
+        /// </summary>
+        public static bool NetworkTransformBase_Update_Prefix(object __instance)
+        {
+            if (!Plugin.HeadlessMode.Value) return true;
+
+            try
+            {
+                // Get the NetworkIdentity from the component
+                var componentType = __instance.GetType();
+                var identityProp = componentType.GetProperty("netIdentity", BindingFlags.Public | BindingFlags.Instance);
+                if (identityProp == null)
+                {
+                    identityProp = componentType.GetProperty("NetworkIdentity", BindingFlags.Public | BindingFlags.Instance);
+                }
+
+                var identity = identityProp?.GetValue(__instance) as Mirror.NetworkIdentity;
+                if (identity == null) return true;
+
+                // Check if this is a server-only object (not owned by a client)
+                // On a dedicated server, the host's player is server-only
+                if (identity.isServer && !identity.isClient)
+                {
+                    // This is the ghost host player - skip position sync
+                    return false;
+                }
+            }
+            catch { }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Prefix for NetworkTransformBase.OnSerialize - reduce data sent for ghost player.
+        /// </summary>
+        public static bool NetworkTransformBase_OnSerialize_Prefix(object __instance)
+        {
+            if (!Plugin.HeadlessMode.Value) return true;
+
+            try
+            {
+                var componentType = __instance.GetType();
+                var identityProp = componentType.GetProperty("netIdentity", BindingFlags.Public | BindingFlags.Instance);
+                var identity = identityProp?.GetValue(__instance) as Mirror.NetworkIdentity;
+
+                if (identity != null && identity.isServer && !identity.isClient)
+                {
+                    // Ghost player - skip serialization
+                    return false;
+                }
+            }
+            catch { }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Prefix for CmdClientToServerSync - allow normal client position updates.
+        /// </summary>
+        public static bool NetworkTransformBase_CmdSync_Prefix()
+        {
+            // Allow client->server sync to work normally
+            return true;
+        }
+
+        /// <summary>
+        /// Prefix for RpcServerToClientSync - skip sending position for ghost player.
+        /// This is the main source of RPC spam - the server constantly sending position updates.
+        /// </summary>
+        public static bool NetworkTransformBase_RpcSync_Prefix(object __instance)
+        {
+            if (!Plugin.HeadlessMode.Value) return true;
+
+            try
+            {
+                var componentType = __instance.GetType();
+                var identityProp = componentType.GetProperty("netIdentity", BindingFlags.Public | BindingFlags.Instance);
+                var identity = identityProp?.GetValue(__instance) as Mirror.NetworkIdentity;
+
+                if (identity != null && identity.isServer && !identity.isClient)
+                {
+                    // Ghost player - don't send RPC
+                    return false;
+                }
+            }
+            catch { }
+
+            return true;
+        }
+
+        /// <summary>
         /// Patch TechNetworkManager.Awake to destroy FizzyFacepunch (Steam transport) after creation.
         /// This frees up any ports it might bind and allows our KCP transport to work.
         /// </summary>
@@ -771,20 +1143,43 @@ namespace TechtonicaDedicatedServer.Patches
         {
             try
             {
-                // Patch SceneManager.LoadSceneAsync to return pre-completed operations
+                // Patch SceneManager.LoadSceneAsync to use sync loading in headless mode
                 var sceneManagerType = typeof(UnityEngine.SceneManagement.SceneManager);
 
-                // Get all LoadSceneAsync overloads
+                // Get the LoadSceneAsync(string, LoadSceneMode) overload specifically
+                var loadSceneAsyncMethod = sceneManagerType.GetMethod("LoadSceneAsync",
+                    new Type[] { typeof(string), typeof(UnityEngine.SceneManagement.LoadSceneMode) });
+
+                if (loadSceneAsyncMethod != null)
+                {
+                    try
+                    {
+                        // Use PREFIX to do sync loading before async
+                        var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadSceneAsync_SyncPrefix));
+                        var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadSceneAsync_Postfix));
+                        harmony.Patch(loadSceneAsyncMethod, prefix: prefix, postfix: postfix);
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Patched SceneManager.LoadSceneAsync(string, LoadSceneMode) with SYNC prefix");
+                    }
+                    catch (Exception patchEx)
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] Failed to patch LoadSceneAsync with prefix: {patchEx.Message}");
+                    }
+                }
+
+                // Get all other LoadSceneAsync overloads and patch with postfix only
                 var loadSceneAsyncMethods = sceneManagerType.GetMethods(BindingFlags.Public | BindingFlags.Static)
                     .Where(m => m.Name == "LoadSceneAsync");
 
                 foreach (var method in loadSceneAsyncMethods)
                 {
+                    // Skip the one we already patched
+                    if (method == loadSceneAsyncMethod) continue;
+
                     try
                     {
                         var postfix = new HarmonyMethod(typeof(HeadlessPatches), nameof(LoadSceneAsync_Postfix));
                         harmony.Patch(method, postfix: postfix);
-                        Plugin.Log.LogInfo($"[HeadlessPatches] Patched SceneManager.LoadSceneAsync ({method.GetParameters().Length} params)");
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Patched SceneManager.LoadSceneAsync ({method.GetParameters().Length} params) with postfix");
                     }
                     catch (Exception patchEx)
                     {
@@ -952,6 +1347,35 @@ namespace TechtonicaDedicatedServer.Patches
             catch (Exception ex)
             {
                 Plugin.Log.LogWarning($"[HeadlessPatches] LoadSceneAsync_Postfix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// PREFIX for SceneManager.LoadSceneAsync - replace async with sync loading in headless mode
+        /// </summary>
+        public static bool LoadSceneAsync_SyncPrefix(string sceneName, UnityEngine.SceneManagement.LoadSceneMode mode, ref AsyncOperation __result)
+        {
+            if (!Plugin.HeadlessMode.Value) return true; // Let original run
+
+            try
+            {
+                Plugin.Log.LogInfo($"[HeadlessPatches] LoadSceneAsync intercepted - using SYNC load for scene: {sceneName}");
+
+                // Use synchronous scene loading instead
+                UnityEngine.SceneManagement.SceneManager.LoadScene(sceneName, mode);
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] Sync scene load complete: {sceneName}");
+
+                // Create a completed AsyncOperation to return
+                // We can't create a real AsyncOperation, but we need to return something
+                // The caller will check isDone which we can't set
+                // Best we can do is let the original run but the sync load already happened
+                return true; // Let original create the AsyncOperation, but scene is already loaded
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] Sync scene load FAILED for {sceneName}: {ex.Message}");
+                return true; // Fall back to async
             }
         }
 
@@ -2219,22 +2643,33 @@ namespace TechtonicaDedicatedServer.Patches
                     Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.SendNetworkAction patched");
                 }
 
-                // Patch CmdSendNetworkAction (server-side command handler)
-                var cmdSendActionMethod = AccessTools.Method(relayType, "CmdSendNetworkAction");
-                if (cmdSendActionMethod != null)
-                {
-                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_CmdSendNetworkAction_Prefix));
-                    harmony.Patch(cmdSendActionMethod, prefix: prefix);
-                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.CmdSendNetworkAction patched");
-                }
+                // Patch ACTUAL command handlers - there's no "CmdSendNetworkAction", each command has its own handler
+                // Patch key commands: MOLECommand (mining), HitVoxelCommand (voxel mining), TakeAllCommand (pickup)
+                var commandsToPatch = new[] {
+                    "UserCode_MOLECommand",
+                    "UserCode_HitVoxelCommand",
+                    "UserCode_HitDestructableCommand",
+                    "UserCode_TakeAllCommand",
+                    "UserCode_CraftCommand",
+                    "UserCode_InteractCommand",
+                    "UserCode_ActivateMachineCommand",
+                    "UserCode_ModifyMouseBufferCommand",
+                    "UserCode_ExchangeMachineInvCommand"
+                };
 
-                // Patch UserCode_CmdSendNetworkAction (actual handler)
-                var userCodeMethod = AccessTools.Method(relayType, "UserCode_CmdSendNetworkAction");
-                if (userCodeMethod != null)
+                var commandPrefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(GenericCommand_Prefix));
+                foreach (var cmdName in commandsToPatch)
                 {
-                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(NetworkMessageRelay_UserCode_CmdSendNetworkAction_Prefix));
-                    harmony.Patch(userCodeMethod, prefix: prefix);
-                    Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay.UserCode_CmdSendNetworkAction patched");
+                    var cmdMethod = AccessTools.Method(relayType, cmdName);
+                    if (cmdMethod != null)
+                    {
+                        harmony.Patch(cmdMethod, prefix: commandPrefix);
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Patched {cmdName}");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] {cmdName} not found!");
+                    }
                 }
 
                 // Patch UserCode_RequestCurrentSimTick - the SERVER-SIDE handler
@@ -2253,10 +2688,590 @@ namespace TechtonicaDedicatedServer.Patches
                 }
 
                 Plugin.Log.LogInfo("[HeadlessPatches] NetworkMessageRelay patches applied");
+
+                // Start a coroutine to periodically check and fix the server's relay netId
+                var plugin = Plugin.Instance;
+                if (plugin != null)
+                {
+                    plugin.StartCoroutine(MonitorRelayNetId());
+                }
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"[HeadlessPatches] NetworkMessageRelay patch failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Patch FactorySimManager.SimUpdateAll to handle null Player.instance.
+        /// On a headless server, Player.instance is null, which crashes SimUpdateAll.
+        /// This patch processes the HostQueue manually when Player.instance is null.
+        /// </summary>
+        private static void PatchFactorySimManager(Harmony harmony)
+        {
+            try
+            {
+                var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                if (factorySimType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] FactorySimManager type not found");
+                    return;
+                }
+
+                // Patch Update() to check if it's called
+                var updateMethod = AccessTools.Method(factorySimType, "Update");
+                if (updateMethod != null)
+                {
+                    var updatePrefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(FactorySimManager_Update_Prefix));
+                    harmony.Patch(updateMethod, prefix: updatePrefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] FactorySimManager.Update patched");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] FactorySimManager.Update not found");
+                }
+
+                var simUpdateAllMethod = AccessTools.Method(factorySimType, "SimUpdateAll");
+                if (simUpdateAllMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(FactorySimManager_SimUpdateAll_Prefix));
+                    harmony.Patch(simUpdateAllMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] FactorySimManager.SimUpdateAll patched");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] FactorySimManager.SimUpdateAll not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] FactorySimManager patch failed: {ex}");
+            }
+        }
+
+        /// <summary>
+        /// Prefix for FactorySimManager.Update - checks if Update is being called
+        /// Also forces initialization if _needInit is still true
+        /// </summary>
+        private static int _factoryUpdateCallCount = 0;
+        private static bool _forceInitAttempted = false;
+
+        public static void FactorySimManager_Update_Prefix(object __instance)
+        {
+            _factoryUpdateCallCount++;
+            if (_factoryUpdateCallCount % 300 == 1)
+            {
+                Plugin.Log.LogInfo($"[HeadlessPatches] FactorySimManager.Update called #{_factoryUpdateCallCount}");
+            }
+
+            // Check if simulation is stuck in initialization state
+            if (!_forceInitAttempted && _factoryUpdateCallCount > 1000)
+            {
+                try
+                {
+                    // Check _needInit field
+                    var needInitField = __instance.GetType().GetField("_needInit", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (needInitField != null)
+                    {
+                        bool needInit = (bool)needInitField.GetValue(__instance);
+                        if (needInit)
+                        {
+                            Plugin.Log.LogWarning("[HeadlessPatches] FactorySimManager still needs init after 1000 updates! Forcing initialization...");
+
+                            // Try to call PostLoadInit
+                            var postLoadInitMethod = __instance.GetType().GetMethod("PostLoadInit", BindingFlags.Public | BindingFlags.Instance);
+                            if (postLoadInitMethod != null)
+                            {
+                                try
+                                {
+                                    postLoadInitMethod.Invoke(__instance, null);
+                                    Plugin.Log.LogInfo("[HeadlessPatches] Called PostLoadInit() successfully!");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Plugin.Log.LogWarning($"[HeadlessPatches] PostLoadInit failed: {ex.InnerException?.Message ?? ex.Message}");
+                                    // Force _needInit = false directly
+                                    needInitField.SetValue(__instance, false);
+                                    Plugin.Log.LogInfo("[HeadlessPatches] Forced _needInit = false directly");
+                                }
+                            }
+                            else
+                            {
+                                // Just force _needInit = false
+                                needInitField.SetValue(__instance, false);
+                                Plugin.Log.LogInfo("[HeadlessPatches] Forced _needInit = false (no PostLoadInit method found)");
+                            }
+
+                            _forceInitAttempted = true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] Force init check error: {ex.Message}");
+                    _forceInitAttempted = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Prefix for FactorySimManager.SimUpdateAll - handles null Player.instance
+        /// When Player.instance is null (headless server), we run the full simulation manually
+        /// </summary>
+        private static int _simUpdateAllCallCount = 0;
+        private static float _timeToProcess = 0f;
+        private static int _targetTick = 0;
+        private static bool _tickInitialized = false;
+        private const float TICK_INTERVAL = 1f / 64f; // 64 ticks per second
+
+        public static bool FactorySimManager_SimUpdateAll_Prefix(object __instance, float dt)
+        {
+            _simUpdateAllCallCount++;
+
+            try
+            {
+                // Check if Player.instance.cheats.simSpeed is accessible (needed by original method)
+                var playerType = AccessTools.TypeByName("Player");
+                if (playerType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] SimUpdateAll: Player type not found!");
+                    RunSimulationTick(__instance, dt);
+                    return false;
+                }
+
+                var playerInstanceField = playerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var playerInstance = playerInstanceField?.GetValue(null);
+
+                // Check if we can safely use Player.instance.cheats.simSpeed
+                float simSpeed = 1.0f;
+                bool canUseOriginal = false;
+
+                if (playerInstance != null)
+                {
+                    try
+                    {
+                        // Try to get cheats.simSpeed
+                        var cheatsField = playerType.GetField("cheats", BindingFlags.Public | BindingFlags.Instance);
+                        var cheats = cheatsField?.GetValue(playerInstance);
+                        if (cheats != null)
+                        {
+                            var simSpeedField = cheats.GetType().GetField("simSpeed", BindingFlags.Public | BindingFlags.Instance);
+                            if (simSpeedField != null)
+                            {
+                                var simSpeedValue = simSpeedField.GetValue(cheats);
+                                if (simSpeedValue is float speed && speed > 0)
+                                {
+                                    simSpeed = speed;
+                                    canUseOriginal = true;
+                                    if (_simUpdateAllCallCount % 1000 == 1)
+                                    {
+                                        Plugin.Log.LogInfo($"[HeadlessPatches] SimUpdateAll: Using original with simSpeed={simSpeed}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // cheats.simSpeed not accessible
+                    }
+                }
+
+                if (canUseOriginal)
+                {
+                    // Let original run - Player.instance.cheats.simSpeed is accessible
+                    return true;
+                }
+
+                // Can't use original - run simulation manually with simSpeed = 1.0
+                if (_simUpdateAllCallCount % 1000 == 1)
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] SimUpdateAll #{_simUpdateAllCallCount}: Running manual simulation (simSpeed=1.0)");
+                }
+                RunSimulationTick(__instance, dt);
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] SimUpdateAll_Prefix error: {ex.Message}");
+                RunSimulationTick(__instance, dt);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Run the full simulation tick manually when Player.instance is null
+        /// This replicates SimUpdateAll logic with simSpeed = 1.0
+        /// </summary>
+        private static void RunSimulationTick(object factorySimInstance, float dt)
+        {
+            try
+            {
+                // Get MachineManager.instance
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType == null)
+                {
+                    if (_simUpdateAllCallCount % 1000 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] RunSimulationTick: MachineManager type not found!");
+                    return;
+                }
+
+                var mmInstanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var mmInstance = mmInstanceField?.GetValue(null);
+                if (mmInstance == null)
+                {
+                    // MachineManager.instance is null - try to set it from FactorySimManager.machineManagers
+                    var factorySimType = AccessTools.TypeByName("FactorySimManager");
+                    if (factorySimType != null)
+                    {
+                        var fsInstanceProp = factorySimType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                        var fsInstance = fsInstanceProp?.GetValue(null);
+
+                        if (fsInstance != null)
+                        {
+                            // Get machineManagers array
+                            var mmArrayField = factorySimType.GetField("machineManagers", BindingFlags.Public | BindingFlags.Instance);
+                            var mmArray = mmArrayField?.GetValue(fsInstance) as Array;
+
+                            if (mmArray != null && mmArray.Length > 0)
+                            {
+                                // Get machineStateIndex (default to 0)
+                                var stateIndexField = factorySimType.GetField("machineStateIndex", BindingFlags.Public | BindingFlags.Instance);
+                                int stateIndex = 0;
+                                if (stateIndexField != null)
+                                {
+                                    var indexVal = stateIndexField.GetValue(fsInstance);
+                                    if (indexVal is int idx)
+                                        stateIndex = idx;
+                                }
+
+                                // Get the machine manager from the array
+                                var selectedMM = mmArray.GetValue(stateIndex);
+                                if (selectedMM != null)
+                                {
+                                    // Set MachineManager.instance
+                                    mmInstanceField.SetValue(null, selectedMM);
+                                    mmInstance = selectedMM;
+                                    Plugin.Log.LogInfo($"[HeadlessPatches] Set MachineManager.instance from machineManagers[{stateIndex}]");
+                                }
+                                else if (_simUpdateAllCallCount % 1000 == 1)
+                                {
+                                    Plugin.Log.LogWarning($"[HeadlessPatches] machineManagers[{stateIndex}] is null!");
+                                }
+                            }
+                        }
+                    }
+
+                    // If still null, abort
+                    if (mmInstance == null)
+                    {
+                        if (_simUpdateAllCallCount % 1000 == 1)
+                            Plugin.Log.LogWarning("[HeadlessPatches] RunSimulationTick: MachineManager.instance is still null!");
+                        return;
+                    }
+                }
+
+                // Get curTick
+                var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                int curTick = (int)(curTickField?.GetValue(mmInstance) ?? 0);
+
+                // Initialize target tick - use cached startTick from save data
+                // Keep checking until we get a valid save tick (save data may not be parsed immediately)
+                if (!_tickInitialized || (curTick < 100000 && _simUpdateAllCallCount % 100 == 0))
+                {
+                    // Get startTick from ServerConnectionHandler (extracted from save file JSON)
+                    int saveTick = Networking.ServerConnectionHandler.CachedStartTick;
+
+                    // Debug log every 500 calls
+                    if (_simUpdateAllCallCount % 500 == 1)
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Tick check: curTick={curTick}, saveTick={saveTick}");
+                    }
+
+                    // If we found a valid save tick and it's much higher than current, jump to it
+                    if (saveTick > 100000 && curTick < saveTick)
+                    {
+                        int oldTick = curTick;
+                        curTickField?.SetValue(mmInstance, saveTick);
+                        _targetTick = saveTick;
+                        curTick = saveTick;
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Jumped to save tick: {saveTick} (was at {oldTick})");
+                    }
+
+                    if (!_tickInitialized)
+                    {
+                        _targetTick = curTick;
+                        _tickInitialized = true;
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Simulation initialized at tick {curTick}");
+                    }
+                }
+
+                // Advance time with simSpeed = 1.0
+                _timeToProcess += dt * 1.0f;
+
+                // Calculate tick advancement (same as original: 64 ticks per second)
+                if (_timeToProcess >= TICK_INTERVAL)
+                {
+                    int ticksToAdvance = (int)(_timeToProcess / TICK_INTERVAL);
+                    _targetTick += ticksToAdvance;
+                    _timeToProcess -= ticksToAdvance * TICK_INTERVAL;
+                }
+
+                // Process HostQueue before updating machines
+                ProcessHostQueueManually(factorySimInstance, dt);
+
+                // Calculate how many ticks to process
+                int ticksToProcess = _targetTick - curTick;
+
+                // Log every 100 calls
+                if (_simUpdateAllCallCount % 100 == 1)
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] SimTick #{_simUpdateAllCallCount}: curTick={curTick}, targetTick={_targetTick}, toProcess={ticksToProcess}");
+                }
+
+                // Update machines for each tick
+                if (ticksToProcess > 0)
+                {
+                    var updateAllMethod = machineManagerType.GetMethod("UpdateAll", BindingFlags.Public | BindingFlags.Instance);
+                    bool updateAllSucceeded = false;
+
+                    if (updateAllMethod != null)
+                    {
+                        for (int i = 1; i <= ticksToProcess; i++)
+                        {
+                            bool isLastTick = (i == ticksToProcess);
+                            try
+                            {
+                                // UpdateAll(bool isRefresh, bool isIncrement = true)
+                                // For normal updates: isRefresh = true only on last tick
+                                updateAllMethod.Invoke(mmInstance, new object[] { isLastTick, true });
+                                updateAllSucceeded = true;
+                            }
+                            catch (Exception ex)
+                            {
+                                // UpdateAll failed - manually increment curTick so tick keeps advancing
+                                curTickField?.SetValue(mmInstance, curTick + 1);
+                                curTick++;
+
+                                // Log occasionally
+                                if (_simUpdateAllCallCount % 1000 == 1)
+                                {
+                                    Plugin.Log.LogWarning($"[HeadlessPatches] UpdateAll error (tick {curTick}): {ex.InnerException?.Message ?? ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // No UpdateAll method - just increment curTick directly
+                        int newTick = curTick + ticksToProcess;
+                        curTickField?.SetValue(mmInstance, newTick);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] RunSimulationTick error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Manually process the HostQueue when Player.instance is null
+        /// This mirrors the logic from SimUpdateAll but without the Player dependencies
+        /// </summary>
+        private static int _processQueueCallCount = 0;
+
+        private static void ProcessHostQueueManually(object factorySimInstance, float dt)
+        {
+            _processQueueCallCount++;
+
+            try
+            {
+                // Get MachineManager.instance.curTick
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType == null)
+                {
+                    if (_processQueueCallCount % 100 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] ProcessQueue: MachineManager type not found");
+                    return;
+                }
+
+                var mmInstanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var mmInstance = mmInstanceField?.GetValue(null);
+                if (mmInstance == null)
+                {
+                    if (_processQueueCallCount % 100 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] ProcessQueue: MachineManager.instance is null");
+                    return;
+                }
+
+                // Get curTick
+                var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                var curTick = (int)(curTickField?.GetValue(mmInstance) ?? 0);
+
+                // Get NetworkMessageRelay.instance
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    if (_processQueueCallCount % 100 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] ProcessQueue: NetworkMessageRelay type not found");
+                    return;
+                }
+
+                var relayInstanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var relayInstance = relayInstanceField?.GetValue(null);
+                if (relayInstance == null)
+                {
+                    if (_processQueueCallCount % 100 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] ProcessQueue: NetworkMessageRelay.instance is null");
+                    return;
+                }
+
+                // Get HostQueue
+                var hostQueueProp = relayType.GetProperty("HostQueue", BindingFlags.Public | BindingFlags.Instance);
+                if (hostQueueProp == null)
+                {
+                    if (_processQueueCallCount % 100 == 1)
+                        Plugin.Log.LogWarning("[HeadlessPatches] ProcessQueue: HostQueue property not found");
+                    return;
+                }
+
+                var hostQueue = hostQueueProp.GetValue(relayInstance) as System.Collections.ICollection;
+                if (hostQueue == null || hostQueue.Count == 0) return;
+
+                // Found items in queue - log this!
+                Plugin.Log.LogInfo($"[HeadlessPatches] ProcessQueue: Found {hostQueue.Count} items in HostQueue, curTick={curTick}");
+
+                // Get the queue as proper type to dequeue
+                var enqueuedActionType = AccessTools.TypeByName("EnqueuedNetworkAction");
+                var dequeueMethod = hostQueueProp.PropertyType.GetMethod("Dequeue");
+                var countProp = hostQueueProp.PropertyType.GetProperty("Count");
+
+                int processed = 0;
+                while ((int)countProp.GetValue(hostQueueProp.GetValue(relayInstance)) > 0)
+                {
+                    var enqueuedAction = dequeueMethod.Invoke(hostQueueProp.GetValue(relayInstance), null);
+                    if (enqueuedAction == null) break;
+
+                    // Get action and sender from EnqueuedNetworkAction
+                    var actionField = enqueuedActionType.GetField("action");
+                    var senderField = enqueuedActionType.GetField("sender");
+
+                    var action = actionField?.GetValue(enqueuedAction);
+                    var sender = senderField?.GetValue(enqueuedAction);
+
+                    if (action == null) continue;
+
+                    // Set tick on action.GetInfo()
+                    var getInfoMethod = action.GetType().GetMethod("GetInfo");
+                    if (getInfoMethod != null)
+                    {
+                        var info = getInfoMethod.Invoke(action, null);
+                        if (info != null)
+                        {
+                            var tickField = info.GetType().GetField("tick");
+                            tickField?.SetValue(info, curTick);
+
+                            var actionTypeField = info.GetType().GetField("actionType");
+                            var actionTypeProp = action.GetType().GetProperty("actionType");
+                            if (actionTypeField != null && actionTypeProp != null)
+                            {
+                                actionTypeField.SetValue(info, actionTypeProp.GetValue(action));
+                            }
+                        }
+                    }
+
+                    // Call ProcessOnHost(sender)
+                    var processMethod = action.GetType().GetMethod("ProcessOnHost");
+                    if (processMethod != null)
+                    {
+                        try
+                        {
+                            var success = processMethod.Invoke(action, new object[] { sender });
+                            Plugin.Log.LogInfo($"[HeadlessPatches] ProcessOnHost({action.GetType().Name}) returned {success}");
+                            processed++;
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Log.LogWarning($"[HeadlessPatches] ProcessOnHost error: {ex.Message}");
+                        }
+                    }
+
+                    // Skip ClearPendingAction since Player.instance is null
+                }
+
+                if (processed > 0)
+                {
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Processed {processed} actions from HostQueue");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] ProcessHostQueueManually error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Monitors the server's NetworkMessageRelay and ensures it has netId=1
+        /// so client commands (which we force to use netId=1) will be routed correctly.
+        /// </summary>
+        private static System.Collections.IEnumerator MonitorRelayNetId()
+        {
+            yield return new WaitForSeconds(5f);
+
+            while (true)
+            {
+                try
+                {
+                    if (NetworkServer.active)
+                    {
+                        var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                        if (relayType != null)
+                        {
+                            var relayInstanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                            var relayInstance = relayInstanceField?.GetValue(null) as MonoBehaviour;
+
+                            if (relayInstance != null)
+                            {
+                                var identity = relayInstance.GetComponent<NetworkIdentity>();
+                                if (identity != null)
+                                {
+                                    var currentNetId = identity.netId;
+                                    Plugin.Log.LogInfo($"[HeadlessPatches] Server NetworkMessageRelay netId = {currentNetId}");
+
+                                    // If netId is not 1, we need to add it to spawned dict with netId=1
+                                    if (currentNetId != 1)
+                                    {
+                                        Plugin.Log.LogInfo($"[HeadlessPatches] Server relay has netId={currentNetId}, adding alias for netId=1");
+
+                                        // Add this identity to spawned with netId=1 as alias
+                                        if (!NetworkServer.spawned.ContainsKey(1))
+                                        {
+                                            NetworkServer.spawned[1] = identity;
+                                            Plugin.Log.LogInfo($"[HeadlessPatches] Added server relay to NetworkServer.spawned[1]");
+                                        }
+                                    }
+
+                                    // Log what's in the spawned dictionary
+                                    Plugin.Log.LogInfo($"[HeadlessPatches] NetworkServer.spawned count: {NetworkServer.spawned.Count}");
+                                    foreach (var kvp in NetworkServer.spawned.Take(10))
+                                    {
+                                        var name = kvp.Value?.gameObject?.name ?? "null";
+                                        var typeName = kvp.Value?.GetType()?.Name ?? "null";
+                                        Plugin.Log.LogInfo($"[HeadlessPatches]   spawned[{kvp.Key}] = {name} ({typeName})");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] MonitorRelayNetId error: {ex.Message}");
+                }
+
+                yield return new WaitForSeconds(10f);
             }
         }
 
@@ -2323,39 +3338,399 @@ namespace TechtonicaDedicatedServer.Patches
         }
 
         /// <summary>
-        /// Prefix for NetworkMessageRelay.UserCode_CmdSendNetworkAction - actual server handler
+        /// Generic prefix for all command handlers - logs when server receives a command
         /// </summary>
-        public static bool NetworkMessageRelay_UserCode_CmdSendNetworkAction_Prefix(object __instance, object action)
+        /// <summary>
+        /// Postfix for UserCode commands - directly process the action after it's enqueued
+        /// since SimUpdateAll might not be running to drain the queue
+        /// </summary>
+        public static bool GenericCommand_Prefix(object __instance, object action, NetworkConnectionToClient sender, MethodBase __originalMethod)
         {
             try
             {
-                var actionType = action?.GetType().Name ?? "null";
-                Plugin.Log.LogInfo($"[HeadlessPatches] UserCode_CmdSendNetworkAction: {actionType}");
+                var methodName = __originalMethod?.Name ?? "Unknown";
+                var actionType = action?.GetType()?.Name ?? "null";
+                Plugin.Log.LogInfo($"[HeadlessPatches] COMMAND RECEIVED: {methodName} with action {actionType}");
 
-                // Try to execute the action
-                if (action != null)
+                // DEBUG: Check sender and authenticationData
+                if (sender == null)
                 {
-                    var executeMethod = action.GetType().GetMethod("Execute",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (executeMethod != null)
+                    Plugin.Log.LogWarning($"[HeadlessPatches] sender is NULL!");
+                    return true; // Let original run if we can't handle it
+                }
+                var authData = sender.authenticationData;
+                Plugin.Log.LogInfo($"[HeadlessPatches] sender.connectionId={sender.connectionId}, authData={authData} (type={authData?.GetType()?.Name})");
+
+                // DEBUG: Check GameState.instance and allPlayers
+                var gameStateType = AccessTools.TypeByName("GameState");
+                object gameStateInstance = null;
+                object allPlayers = null;
+                if (gameStateType != null)
+                {
+                    var gsInstField = gameStateType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    gameStateInstance = gsInstField?.GetValue(null);
+                    if (gameStateInstance != null)
                     {
-                        try
+                        var allPlayersField = gameStateType.GetField("allPlayers", BindingFlags.Public | BindingFlags.Instance);
+                        allPlayers = allPlayersField?.GetValue(gameStateInstance);
+
+                        if (allPlayers != null)
                         {
-                            Plugin.Log.LogInfo($"[HeadlessPatches] Executing action via UserCode: {actionType}");
-                            executeMethod.Invoke(action, null);
+                            var dictType = allPlayers.GetType();
+                            var countProp = dictType.GetProperty("Count");
+                            var keysProperty = dictType.GetProperty("Keys");
+                            int count = (int)countProp.GetValue(allPlayers);
+                            var keys = keysProperty.GetValue(allPlayers) as IEnumerable<string>;
+                            Plugin.Log.LogInfo($"[HeadlessPatches] GameState.allPlayers has {count} entries: [{string.Join(", ", keys ?? new string[0])}]");
+
+                            // Check if this sender's player is registered
+                            string playerId = authData as string;
+                            if (!string.IsNullOrEmpty(playerId))
+                            {
+                                var containsKeyMethod = dictType.GetMethod("ContainsKey");
+                                bool hasPlayer = (bool)containsKeyMethod.Invoke(allPlayers, new object[] { playerId });
+                                Plugin.Log.LogInfo($"[HeadlessPatches] Player '{playerId}' in allPlayers: {hasPlayer}");
+
+                                if (!hasPlayer)
+                                {
+                                    // Player not registered - try to find their NetworkedPlayer and register
+                                    Plugin.Log.LogWarning($"[HeadlessPatches] Player '{playerId}' NOT in allPlayers! Attempting manual registration...");
+                                    TryRegisterPlayerInAllPlayers(sender, playerId, allPlayers);
+                                }
+                            }
                         }
-                        catch (Exception execEx)
+                        else
                         {
-                            Plugin.Log.LogWarning($"[HeadlessPatches] Action execute failed: {execEx.Message}");
+                            Plugin.Log.LogWarning($"[HeadlessPatches] GameState.allPlayers is NULL");
                         }
                     }
+                    else
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] GameState.instance is NULL");
+                    }
                 }
-                return true; // Allow original to continue (for RPC relay to clients)
+
+                // Directly process the action instead of waiting for SimUpdateAll
+                // since SimUpdateAll doesn't run on headless server
+                if (action != null)
+                {
+                    // Get curTick from MachineManager
+                    int curTick = 724189; // default
+                    var mmType = AccessTools.TypeByName("MachineManager");
+                    if (mmType != null)
+                    {
+                        var mmInstField = mmType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                        var mmInstance = mmInstField?.GetValue(null);
+                        if (mmInstance != null)
+                        {
+                            var curTickField = mmType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            curTick = (int)(curTickField?.GetValue(mmInstance) ?? curTick);
+                        }
+                    }
+
+                    // Get info from action
+                    var getInfoMethod = action.GetType().GetMethod("GetInfo");
+                    object info = null;
+                    if (getInfoMethod != null)
+                    {
+                        info = getInfoMethod.Invoke(action, null);
+                        if (info != null)
+                        {
+                            var tickField = info.GetType().GetField("tick");
+                            tickField?.SetValue(info, curTick);
+                        }
+                    }
+
+                    // HEADLESS MODE: Broadcast the action to all clients via NetworkMessageRelay RPC
+                    bool broadcastSucceeded = BroadcastActionToClients(actionType, info, sender);
+
+                    if (broadcastSucceeded)
+                    {
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Broadcasted {actionType} to all clients");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning($"[HeadlessPatches] Failed to broadcast {actionType} - no handler");
+                    }
+
+                    // ALSO try to process the action on the server for state persistence
+                    // This updates terrain, props, etc. so they persist in saves
+                    try
+                    {
+                        var processOnHostMethod = action.GetType().GetMethod("ProcessOnHost", BindingFlags.Public | BindingFlags.Instance);
+                        if (processOnHostMethod != null)
+                        {
+                            Plugin.Log.LogInfo($"[HeadlessPatches] Attempting ProcessOnHost for {actionType}...");
+                            processOnHostMethod.Invoke(action, new object[] { sender });
+                            Plugin.Log.LogInfo($"[HeadlessPatches] ProcessOnHost succeeded for {actionType}");
+                        }
+                    }
+                    catch (Exception processEx)
+                    {
+                        // ProcessOnHost may fail on headless server - that's OK, broadcast already happened
+                        // Log at debug level since this is expected for many actions
+                        Plugin.Log.LogInfo($"[HeadlessPatches] ProcessOnHost for {actionType}: {processEx.InnerException?.Message ?? processEx.Message}");
+                    }
+                }
+
+                // Skip the original method - we've already handled broadcast + attempted ProcessOnHost
+                return false;
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError($"[HeadlessPatches] UserCode_CmdSendNetworkAction error: {ex.Message}");
+                Plugin.Log.LogWarning($"[HeadlessPatches] GenericCommand_Prefix error: {ex.Message}");
+                return true; // Let original run on error
+            }
+        }
+
+        /// <summary>
+        /// Broadcasts an action to all clients by calling the appropriate RPC on NetworkMessageRelay.
+        /// This bypasses ProcessOnHost validation which fails on headless servers without game world data.
+        /// </summary>
+        private static bool BroadcastActionToClients(string actionType, object info, NetworkConnectionToClient sender)
+        {
+            if (info == null)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] Cannot broadcast {actionType} - info is null");
+                return false;
+            }
+
+            try
+            {
+                // Get NetworkMessageRelay.instance
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] relayType is null for {actionType}");
+                    return false;
+                }
+                Plugin.Log.LogInfo($"[HeadlessPatches] Found relay type, info type={info.GetType().Name}");
+
+                var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                Plugin.Log.LogInfo($"[HeadlessPatches] instanceField={instanceField != null}");
+                object relayInstance = instanceField?.GetValue(null);
+                Plugin.Log.LogInfo($"[HeadlessPatches] relayInstance={relayInstance != null}");
+                if (relayInstance == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] NetworkMessageRelay.instance is null");
+                    return false;
+                }
+
+                // Map action types to their broadcast RPC methods
+                // The RPC method name is usually the action name without "Action" suffix
+                Plugin.Log.LogInfo($"[HeadlessPatches] Mapping actionType={actionType}");
+                string rpcMethodName = null;
+                switch (actionType)
+                {
+                    case "MOLEAction":
+                        rpcMethodName = "MOLEAction";
+                        break;
+                    case "TakeAllAction":
+                        rpcMethodName = "TakeAllFromMachine";
+                        break;
+                    case "HitDestructibleAction":
+                        rpcMethodName = "HitDestructable";
+                        break;
+                    case "ActivateMachineAction":
+                        rpcMethodName = "ActivateMachine";
+                        break;
+                    case "DeactivateTechAction":
+                        rpcMethodName = "DeactivateTech";
+                        break;
+                    case "ExchangeMachineAction":
+                        rpcMethodName = "ExchangeMachineInventory";
+                        break;
+                    case "BuildAction":
+                    case "SimpleBuildAction":
+                        rpcMethodName = "RpcBuildSimpleMachine";
+                        break;
+                    case "ConveyorBuildAction":
+                        rpcMethodName = "RpcBuildConveyor";
+                        break;
+                    case "EraseMachineAction":
+                        rpcMethodName = "EraseMachine";
+                        break;
+                    case "RotateMachineAction":
+                        rpcMethodName = "RotateMachine";
+                        break;
+                    case "SetFilterAction":
+                    case "ChangeFilterAction":
+                        rpcMethodName = "SetFilter";
+                        break;
+                    case "HarvestPlantAction":
+                        rpcMethodName = "HarvestPlant";
+                        break;
+                    case "PingAction":
+                        rpcMethodName = "Ping";
+                        break;
+                    case "ShootAction":
+                        rpcMethodName = "Shoot";
+                        break;
+                    case "SwapVariantAction":
+                        rpcMethodName = "SwapVariant";
+                        break;
+                    case "ReplaceAction":
+                        rpcMethodName = "Replace";
+                        break;
+                    case "ActivatePowerAction":
+                        rpcMethodName = "ActivatePower";
+                        break;
+                    case "TempConveyorAction":
+                        rpcMethodName = "TempConveyor";
+                        break;
+                    case "CraftAction":
+                        rpcMethodName = "Craft";
+                        break;
+                    default:
+                        // Try to guess the method name by removing "Action" suffix
+                        if (actionType.EndsWith("Action"))
+                        {
+                            rpcMethodName = actionType.Substring(0, actionType.Length - 6);
+                        }
+                        break;
+                }
+
+                Plugin.Log.LogInfo($"[HeadlessPatches] After switch: rpcMethodName={rpcMethodName ?? "NULL"}");
+                if (string.IsNullOrEmpty(rpcMethodName))
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] No RPC mapping for {actionType}");
+                    return false;
+                }
+
+                // Find the RPC method
+                Plugin.Log.LogInfo($"[HeadlessPatches] Looking for method {rpcMethodName} on relay");
+                var rpcMethod = relayType.GetMethod(rpcMethodName, BindingFlags.Public | BindingFlags.Instance);
+                if (rpcMethod == null)
+                {
+                    // Try with "Rpc" prefix
+                    rpcMethod = relayType.GetMethod("Rpc" + rpcMethodName, BindingFlags.Public | BindingFlags.Instance);
+                }
+                if (rpcMethod == null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] RPC method '{rpcMethodName}' not found on NetworkMessageRelay");
+                    return false;
+                }
+
+                // Get the info object from the action using GetInfo()
+                // Actions have an "info" field and a GetInfo() method that returns it
+                // The RPC methods expect the *Info object (e.g., MOLEActionInfo), not the *Action object
+                object infoObject = info;
+                var getInfoMethod = info.GetType().GetMethod("GetInfo", BindingFlags.Public | BindingFlags.Instance);
+                if (getInfoMethod != null)
+                {
+                    var extractedInfo = getInfoMethod.Invoke(info, null);
+                    if (extractedInfo != null)
+                    {
+                        infoObject = extractedInfo;
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Extracted info: {infoObject.GetType().Name} from {info.GetType().Name}");
+                    }
+                }
+
+                // Populate required fields that ProcessOnHost normally sets
+                // Get player ID from sender's authenticationData
+                string playerId = sender?.authenticationData?.ToString();
+                if (!string.IsNullOrEmpty(playerId))
+                {
+                    // Set instigatingPlayerNetworkID for actions that need it (MOLEAction, etc.)
+                    var instigatingField = infoObject.GetType().GetField("instigatingPlayerNetworkID");
+                    if (instigatingField != null)
+                    {
+                        instigatingField.SetValue(infoObject, playerId);
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Set instigatingPlayerNetworkID={playerId}");
+                    }
+
+                    // Set playerNetworkID for other actions
+                    var playerIdField = infoObject.GetType().GetField("playerNetworkID");
+                    if (playerIdField != null)
+                    {
+                        playerIdField.SetValue(infoObject, playerId);
+                        Plugin.Log.LogInfo($"[HeadlessPatches] Set playerNetworkID={playerId}");
+                    }
+                }
+
+                // Invoke the RPC method with the info object
+                Plugin.Log.LogInfo($"[HeadlessPatches] Calling {rpcMethodName}({infoObject.GetType().Name})");
+                rpcMethod.Invoke(relayInstance, new object[] { infoObject });
                 return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] BroadcastActionToClients error: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] Inner: {ex.InnerException.Message}");
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Attempts to find the NetworkedPlayer for a connection and register them in allPlayers.
+        /// </summary>
+        private static void TryRegisterPlayerInAllPlayers(NetworkConnectionToClient sender, string playerId, object allPlayers)
+        {
+            try
+            {
+                // Find the NetworkedPlayer associated with this connection
+                // sender.identity gives us the NetworkIdentity of the player object
+                var identity = sender.identity;
+                if (identity == null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] sender.identity is null - cannot register player");
+                    return;
+                }
+
+                // Get the NetworkedPlayer component from the identity's gameObject
+                var networkedPlayerType = AccessTools.TypeByName("NetworkedPlayer");
+                if (networkedPlayerType == null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] NetworkedPlayer type not found");
+                    return;
+                }
+
+                var getComponentMethod = typeof(GameObject).GetMethod("GetComponent", new Type[0]).MakeGenericMethod(networkedPlayerType);
+                var networkedPlayer = getComponentMethod.Invoke(identity.gameObject, null);
+
+                if (networkedPlayer == null)
+                {
+                    Plugin.Log.LogWarning($"[HeadlessPatches] No NetworkedPlayer component on identity.gameObject");
+                    return;
+                }
+
+                // Register in allPlayers
+                var dictType = allPlayers.GetType();
+                var addMethod = dictType.GetMethod("Add");
+                addMethod.Invoke(allPlayers, new object[] { playerId, networkedPlayer });
+                Plugin.Log.LogInfo($"[HeadlessPatches] Successfully registered player '{playerId}' in allPlayers!");
+
+                // Also ensure the NetworkedPlayer has its NetworkID set
+                var networkIdField = networkedPlayerType.GetField("NetworkNetworkID", BindingFlags.Public | BindingFlags.Instance);
+                if (networkIdField != null)
+                {
+                    networkIdField.SetValue(networkedPlayer, playerId);
+                    Plugin.Log.LogInfo($"[HeadlessPatches] Set NetworkNetworkID = '{playerId}'");
+                }
+
+                // Create serverInventory if missing
+                var serverInvField = networkedPlayerType.GetField("serverInventory", BindingFlags.Public | BindingFlags.Instance);
+                if (serverInvField != null && serverInvField.GetValue(networkedPlayer) == null)
+                {
+                    var serverInvType = AccessTools.TypeByName("ServerInventory");
+                    if (serverInvType != null)
+                    {
+                        var serverInvCtor = serverInvType.GetConstructor(new Type[] { networkedPlayerType });
+                        if (serverInvCtor != null)
+                        {
+                            var serverInv = serverInvCtor.Invoke(new object[] { networkedPlayer });
+                            serverInvField.SetValue(networkedPlayer, serverInv);
+                            Plugin.Log.LogInfo($"[HeadlessPatches] Created ServerInventory for player");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] TryRegisterPlayerInAllPlayers error: {ex.Message}");
             }
         }
 
@@ -2441,6 +3816,220 @@ namespace TechtonicaDedicatedServer.Patches
                 return false; // Skip original to prevent crash
             }
         }
+
+        #region Wine Socket Compatibility Patches
+
+        private static int _createMismatchCount = 0;
+
+        /// <summary>
+        /// Patches IPEndPointNonAlloc.DeepCopyIPEndPoint to handle Wine's incorrect address families.
+        /// Wine/Mono sometimes returns AddressFamily values that are not IPv4 (2) or IPv6 (23).
+        /// This causes KCP connections to fail with "Unexpected SocketAddress family" errors.
+        /// </summary>
+        private static void PatchIPEndPointNonAlloc(Harmony harmony)
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[HeadlessPatches] Patching IPEndPointNonAlloc for Wine compatibility...");
+
+                // Find the IPEndPointNonAlloc type in WhereAllocation namespace
+                var ipEndPointNonAllocType = AccessTools.TypeByName("WhereAllocation.IPEndPointNonAlloc");
+                if (ipEndPointNonAllocType == null)
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] IPEndPointNonAlloc type not found - checking kcp2k assembly");
+
+                    // Try to find it in loaded assemblies
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        try
+                        {
+                            var type = asm.GetType("WhereAllocation.IPEndPointNonAlloc");
+                            if (type != null)
+                            {
+                                ipEndPointNonAllocType = type;
+                                Plugin.Log.LogInfo($"[HeadlessPatches] Found IPEndPointNonAlloc in {asm.GetName().Name}");
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (ipEndPointNonAllocType == null)
+                {
+                    Plugin.Log.LogError("[HeadlessPatches] Could not find IPEndPointNonAlloc type!");
+                    return;
+                }
+
+                // Patch DeepCopyIPEndPoint method
+                var deepCopyMethod = ipEndPointNonAllocType.GetMethod("DeepCopyIPEndPoint",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (deepCopyMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(IPEndPointNonAlloc_DeepCopyIPEndPoint_Prefix));
+                    harmony.Patch(deepCopyMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] IPEndPointNonAlloc.DeepCopyIPEndPoint patched for Wine compatibility");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] DeepCopyIPEndPoint method not found");
+                }
+
+                // Also patch the Create method which throws on address family mismatch
+                var createMethod = ipEndPointNonAllocType.GetMethod("Create",
+                    BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    new Type[] { typeof(System.Net.SocketAddress) },
+                    null);
+                if (createMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(HeadlessPatches), nameof(IPEndPointNonAlloc_Create_Prefix));
+                    harmony.Patch(createMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[HeadlessPatches] IPEndPointNonAlloc.Create patched for Wine compatibility");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[HeadlessPatches] Create method not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[HeadlessPatches] Failed to patch IPEndPointNonAlloc: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Prefix for IPEndPointNonAlloc.DeepCopyIPEndPoint.
+        /// Handles Wine's incorrect address family by defaulting to IPv4.
+        /// </summary>
+        public static bool IPEndPointNonAlloc_DeepCopyIPEndPoint_Prefix(object __instance, ref System.Net.IPEndPoint __result)
+        {
+            try
+            {
+                // Get the temp SocketAddress field
+                var tempField = __instance.GetType().GetField("temp", BindingFlags.Public | BindingFlags.Instance);
+                if (tempField == null)
+                {
+                    return true; // Let original run
+                }
+
+                var temp = tempField.GetValue(__instance) as System.Net.SocketAddress;
+                if (temp == null)
+                {
+                    return true; // Let original run
+                }
+
+                // Check address family
+                var family = temp.Family;
+                System.Net.IPAddress address;
+
+                if (family == System.Net.Sockets.AddressFamily.InterNetworkV6)
+                {
+                    address = System.Net.IPAddress.IPv6Any;
+                }
+                else if (family == System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    address = System.Net.IPAddress.Any;
+                }
+                else
+                {
+                    // WINE COMPATIBILITY: Unknown address family - default to IPv4
+                    // Wine sometimes returns incorrect address family values (e.g., 22 = Atm)
+                    // We treat these as IPv4 to prevent connection failures
+                    Plugin.DebugLog($"[HeadlessPatches] DeepCopyIPEndPoint: Unknown address family {family} ({(int)family}), defaulting to IPv4");
+                    address = System.Net.IPAddress.Any;
+                }
+
+                // Create the endpoint
+                var baseEndPoint = new System.Net.IPEndPoint(address, 0);
+                __result = (System.Net.IPEndPoint)baseEndPoint.Create(temp);
+                return false; // Skip original
+            }
+            catch (Exception ex)
+            {
+                // If our patch fails, let the original run (which will probably throw too)
+                Plugin.Log.LogWarning($"[HeadlessPatches] DeepCopyIPEndPoint patch error: {ex.Message}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prefix for IPEndPointNonAlloc.Create.
+        /// Handles Wine's incorrect address family by being more lenient.
+        /// </summary>
+        public static bool IPEndPointNonAlloc_Create_Prefix(object __instance, System.Net.SocketAddress socketAddress, ref System.Net.EndPoint __result)
+        {
+            try
+            {
+                // Get the expected address family
+                var addressFamilyProp = __instance.GetType().GetProperty("AddressFamily", BindingFlags.Public | BindingFlags.Instance);
+                if (addressFamilyProp == null)
+                {
+                    return true; // Let original run
+                }
+
+                var expectedFamily = (System.Net.Sockets.AddressFamily)addressFamilyProp.GetValue(__instance);
+                var actualFamily = socketAddress.Family;
+
+                // If families match, let original handle it
+                if (actualFamily == expectedFamily)
+                {
+                    return true;
+                }
+
+                // WINE COMPATIBILITY: If families don't match but both are IP-based or unknown, proceed anyway
+                // Wine sometimes returns incorrect address family values
+                bool isExpectedIP = expectedFamily == System.Net.Sockets.AddressFamily.InterNetwork ||
+                                    expectedFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+                bool isActualIP = actualFamily == System.Net.Sockets.AddressFamily.InterNetwork ||
+                                  actualFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+                bool isActualUnknown = (int)actualFamily != 2 && (int)actualFamily != 23;
+
+                if (isExpectedIP && (isActualIP || isActualUnknown))
+                {
+                    // Log occasionally (use a counter stored in a static field)
+                    _createMismatchCount++;
+                    if (_createMismatchCount <= 5 || _createMismatchCount % 10000 == 0)
+                    {
+                        Plugin.DebugLog($"[HeadlessPatches] Create: Address family mismatch (expected={expectedFamily}, actual={actualFamily}), allowing anyway (Wine compat)");
+                    }
+
+                    // Get temp field and update it - IMPORTANT: Must do the hash trick like original
+                    var tempField = __instance.GetType().GetField("temp", BindingFlags.Public | BindingFlags.Instance);
+                    if (tempField != null)
+                    {
+                        var currentTemp = tempField.GetValue(__instance) as System.Net.SocketAddress;
+                        if (socketAddress != currentTemp)
+                        {
+                            tempField.SetValue(__instance, socketAddress);
+
+                            // CRITICAL: Trigger the m_changed flag for proper GetHashCode
+                            // This is what the original code does: temp[0]++; temp[0]--;
+                            try
+                            {
+                                byte original = socketAddress[0];
+                                socketAddress[0] = (byte)(original + 1);
+                                socketAddress[0] = original;
+                            }
+                            catch { }
+                        }
+                    }
+
+                    __result = (System.Net.EndPoint)__instance;
+                    return false; // Skip original
+                }
+
+                // If not an IP-related case, let original throw
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[HeadlessPatches] Create patch error: {ex.Message}");
+                return true;
+            }
+        }
+
+        #endregion
     }
 
     /// <summary>
@@ -2592,6 +4181,7 @@ namespace TechtonicaDedicatedServer.Patches
         }
 
         private static bool _firstFlowManagerUpdateCall = true;
+        private static int _flowManagerUpdateTickCount = 0;
 
         public static void FlowManager_Update_Postfix()
         {
@@ -2601,6 +4191,65 @@ namespace TechtonicaDedicatedServer.Patches
                 Plugin.DebugLog("[AutoStartPatches] FlowManager.Update postfix FIRST CALL!");
             }
             CheckAutoLoadTrigger("FlowManager.Update");
+
+            // CRITICAL: Tick network transport from Unity's main thread
+            // This avoids Wine's critical section deadlock that blocks the background timer
+            _flowManagerUpdateTickCount++;
+            try
+            {
+                TickNetworkFromMainThread();
+            }
+            catch (Exception ex)
+            {
+                if (_flowManagerUpdateTickCount % 1000 == 1)
+                {
+                    Plugin.Log.LogWarning($"[AutoStartPatches] Network tick error: {ex.Message}");
+                }
+            }
+        }
+
+        private static int _mainThreadNetTickLogCount = 0;
+        private static int _mainThreadLastConnectionCount = 0;
+
+        /// <summary>
+        /// Tick the network transport from Unity's main thread.
+        /// This is more reliable than the background timer under Wine.
+        /// </summary>
+        private static void TickNetworkFromMainThread()
+        {
+            if (!Mirror.NetworkServer.active) return;
+
+            var transport = Mirror.Transport.activeTransport;
+            if (transport == null) return;
+
+            // Log connection count changes
+            int currentConnections = Mirror.NetworkServer.connections.Count;
+            if (currentConnections != _mainThreadLastConnectionCount)
+            {
+                Plugin.Log.LogInfo($"[AutoStartPatches] Connection count changed: {_mainThreadLastConnectionCount} -> {currentConnections}");
+                _mainThreadLastConnectionCount = currentConnections;
+            }
+
+            // Log every 1000 ticks
+            _mainThreadNetTickLogCount++;
+            if (_mainThreadNetTickLogCount % 1000 == 1)
+            {
+                Plugin.Log.LogInfo($"[AutoStartPatches] MainThread tick #{_mainThreadNetTickLogCount}, connections={currentConnections}");
+            }
+
+            // Call ServerEarlyUpdate to receive data
+            try
+            {
+                transport.ServerEarlyUpdate();
+            }
+            catch (Exception) { }
+
+            // Call ServerLateUpdate to send data
+            try
+            {
+                transport.ServerLateUpdate();
+            }
+            catch (Exception) { }
         }
 
         private static bool _firstEventSystemCall = true;

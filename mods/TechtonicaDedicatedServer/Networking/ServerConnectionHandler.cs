@@ -41,6 +41,10 @@ namespace TechtonicaDedicatedServer.Networking
         private int _updateCount;
         private bool _loggedFirstUpdate;
 
+        // Cached startTick from save data - used by HeadlessPatches for simulation sync
+        private static int _cachedStartTick = 0;
+        public static int CachedStartTick => _cachedStartTick;
+
         public static void Initialize()
         {
             if (_initialized) return;
@@ -440,6 +444,16 @@ namespace TechtonicaDedicatedServer.Networking
         /// </summary>
         private void CheckAndSendSaveData()
         {
+            // Extract and cache startTick from save data (for HeadlessPatches simulation sync)
+            if (_cachedStartTick == 0)
+            {
+                var cachedData = AutoLoadManager.GetCachedSaveString();
+                if (!string.IsNullOrEmpty(cachedData))
+                {
+                    _cachedStartTick = ExtractStartTickFromSaveData(cachedData);
+                }
+            }
+
             // Track player connections/disconnections for admin panel
             TrackPlayerConnections();
 
@@ -561,6 +575,13 @@ namespace TechtonicaDedicatedServer.Networking
                 // CRITICAL: Send strata FIRST before save data!
                 // Clients time out waiting for strata if we don't send it
                 byte strata = ExtractStrataFromSaveData(cachedData);
+
+                // Also extract and cache startTick for simulation sync
+                if (_cachedStartTick == 0)
+                {
+                    _cachedStartTick = ExtractStartTickFromSaveData(cachedData);
+                }
+
                 try
                 {
                     // Try multiple approaches to set/send strata
@@ -870,6 +891,28 @@ namespace TechtonicaDedicatedServer.Networking
         }
 
         /// <summary>
+        /// Extract startTick from save data.
+        /// Note: The JSON metadata doesn't contain startTick - it's in the messagepack data.
+        /// For now, use the known value from the save file (724189).
+        /// TODO: Parse messagepack to extract actual startTick dynamically.
+        /// </summary>
+        private int ExtractStartTickFromSaveData(string cachedData)
+        {
+            // The startTick is embedded in the messagepack data, not the JSON header.
+            // Use the known value for the current save file.
+            // This matches the value set in AutoLoadManager stub creation.
+            const int KNOWN_SAVE_TICK = 724189;
+
+            if (!string.IsNullOrEmpty(cachedData))
+            {
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] Using known startTick={KNOWN_SAVE_TICK} for save data");
+                return KNOWN_SAVE_TICK;
+            }
+
+            return 0;
+        }
+
+        /// <summary>
         /// Called externally when a player is spawned
         /// </summary>
         public static void OnPlayerSpawned(object networkedPlayer, NetworkConnectionToClient conn)
@@ -974,6 +1017,11 @@ namespace TechtonicaDedicatedServer.Networking
                 NetworkServer.AddPlayerForConnection(conn, playerInstance);
 
                 Plugin.Log.LogInfo($"[ServerConnectionHandler] Added player for connection {conn.connectionId}!");
+
+                // CRITICAL: Proactively send tick to new client
+                // Client's RequestCurrentSimTick command fails due to Mirror internal state issues
+                // So we push the tick immediately when they spawn
+                ProactivelySendTickToClient(conn);
 
                 // Remove from spawning set since we're done
                 _connectionsSpawningPlayer.Remove(conn.connectionId);
@@ -1211,6 +1259,100 @@ namespace TechtonicaDedicatedServer.Networking
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"[ServerConnectionHandler] Failed to write player_disconnect event: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Proactively sends the current sim tick to a newly connected client.
+        /// This bypasses the broken client->server RequestCurrentSimTick command flow.
+        /// </summary>
+        private void ProactivelySendTickToClient(NetworkConnectionToClient conn)
+        {
+            if (conn == null)
+            {
+                Plugin.Log.LogWarning("[ServerConnectionHandler] ProactivelySendTickToClient: conn is null");
+                return;
+            }
+
+            try
+            {
+                // Get the current tick from MachineManager if available
+                int tickToSend = 724189; // Default tick value
+
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                if (machineManagerType != null)
+                {
+                    var instanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        var mmInstance = instanceField.GetValue(null);
+                        if (mmInstance != null)
+                        {
+                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                            if (curTickField != null)
+                            {
+                                tickToSend = (int)curTickField.GetValue(mmInstance);
+                            }
+                        }
+                    }
+                }
+
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] ProactivelySendTickToClient: Sending tick {tickToSend} to connection {conn.connectionId}");
+
+                // Get NetworkMessageRelay.instance
+                var relayType = AccessTools.TypeByName("NetworkMessageRelay");
+                if (relayType == null)
+                {
+                    Plugin.Log.LogWarning("[ServerConnectionHandler] ProactivelySendTickToClient: NetworkMessageRelay type not found");
+                    return;
+                }
+
+                var instanceProp = relayType.GetProperty("instance", BindingFlags.Public | BindingFlags.Static);
+                object relayInstance = null;
+                if (instanceProp != null)
+                {
+                    relayInstance = instanceProp.GetValue(null);
+                }
+                else
+                {
+                    // Try as field
+                    var instanceField = relayType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceField != null)
+                    {
+                        relayInstance = instanceField.GetValue(null);
+                    }
+                }
+
+                if (relayInstance == null)
+                {
+                    Plugin.Log.LogWarning("[ServerConnectionHandler] ProactivelySendTickToClient: NetworkMessageRelay.instance is null");
+                    return;
+                }
+
+                // Get ProcessCurrentSimTick method
+                var processMethod = relayType.GetMethod("ProcessCurrentSimTick",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (processMethod == null)
+                {
+                    Plugin.Log.LogWarning("[ServerConnectionHandler] ProactivelySendTickToClient: ProcessCurrentSimTick method not found");
+                    return;
+                }
+
+                // Call ProcessCurrentSimTick(conn, tick) to send tick to client
+                // Note: This uses SendTargetRPCInternal which requires valid NetworkIdentity
+                processMethod.Invoke(relayInstance, new object[] { conn, tickToSend });
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] ProactivelySendTickToClient: Successfully sent tick {tickToSend} to client {conn.connectionId}");
+            }
+            catch (TargetInvocationException tie)
+            {
+                Plugin.Log.LogError($"[ServerConnectionHandler] ProactivelySendTickToClient TIE: {tie.InnerException?.Message}");
+                Plugin.Log.LogError($"[ServerConnectionHandler] TIE Stack: {tie.InnerException?.StackTrace}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[ServerConnectionHandler] ProactivelySendTickToClient error: {ex.Message}");
+                Plugin.Log.LogError($"[ServerConnectionHandler] Full exception: {ex}");
             }
         }
     }

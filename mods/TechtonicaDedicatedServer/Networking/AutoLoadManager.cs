@@ -17,9 +17,10 @@ namespace TechtonicaDedicatedServer.Networking
         private static bool _hasAttemptedAutoLoad;
         private static bool _isAutoLoading;
 
-        // Server start scheduling (must happen on main thread)
+        // Server start scheduling (uses DateTime for thread-safe timing)
         private static bool _serverStartPending;
         private static float _serverStartScheduledTime;
+        private static DateTime _serverStartScheduledDateTime = DateTime.MinValue;
 
         // Cached save data for sending to clients (used when PrepSave fails in headless mode)
         private static string _cachedSaveString;
@@ -27,6 +28,111 @@ namespace TechtonicaDedicatedServer.Networking
         private static string _lastLoadedSavePath;
 
         public static bool IsAutoLoading => _isAutoLoading;
+        public static bool IsServerStartPending => _serverStartPending;
+        public static float ServerStartScheduledTime => _serverStartScheduledTime;
+
+        /// <summary>
+        /// Called from the background simulation timer to check if server needs to be started.
+        /// This is needed because Unity's Update() doesn't run reliably in headless mode.
+        /// Uses DateTime for thread-safe timing instead of Time.realtimeSinceStartup.
+        /// </summary>
+        public static void CheckServerStartFromTimer()
+        {
+            if (!_serverStartPending) return;
+            if (DateTime.UtcNow < _serverStartScheduledDateTime) return;
+
+            // Time to start the server
+            Plugin.Log.LogInfo($"[AutoLoad] Timer detected server start time reached! Triggering start...");
+
+            // Try to start the server directly
+            try
+            {
+                TriggerServerStartNow();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[AutoLoad] Timer server start failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Immediately attempts to start the server. Can be called from timer or Update.
+        /// Uses DateTime for thread-safe scheduling.
+        /// </summary>
+        private static void TriggerServerStartNow()
+        {
+            if (!_serverStartPending) return;
+
+            _serverStartPending = false;
+            _serverStartAttempts++;
+            Plugin.Log.LogInfo($"[AutoLoad] TriggerServerStartNow attempt #{_serverStartAttempts}...");
+
+            try
+            {
+                // Check current scene (may throw from background thread, catch and continue)
+                string currentScene = "Unknown";
+                try
+                {
+                    currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+                }
+                catch { /* May fail from background thread */ }
+                Plugin.Log.LogInfo($"[AutoLoad] Current scene: {currentScene}");
+
+                // GHOST HOST MODE: Wait for game world to be loaded
+                bool isMainMenu = currentScene == "Main Menu";
+
+                if (isMainMenu && _serverStartAttempts < 30)
+                {
+                    Plugin.Log.LogInfo("[AutoLoad] Still on Main Menu - rescheduling...");
+                    _serverStartScheduledDateTime = DateTime.UtcNow.AddSeconds(3);
+                    _serverStartPending = true;
+                    return;
+                }
+
+                // At attempt 10+, skip CheckGameSystemsReady() entirely - it hangs from background thread
+                bool gameSystemsReady = false;
+                if (_serverStartAttempts < 10)
+                {
+                    try
+                    {
+                        gameSystemsReady = CheckGameSystemsReady();
+                    }
+                    catch (Exception checkEx)
+                    {
+                        Plugin.Log.LogWarning($"[AutoLoad] CheckGameSystemsReady error: {checkEx.Message}");
+                    }
+
+                    if (!gameSystemsReady)
+                    {
+                        Plugin.Log.LogInfo($"[AutoLoad] Game systems not ready (attempt #{_serverStartAttempts}). Rescheduling...");
+                        _serverStartScheduledDateTime = DateTime.UtcNow.AddSeconds(2);
+                        _serverStartPending = true;
+                        return;
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoLoad] Reached 10 attempts - forcing server start (skipping system check)!");
+                }
+
+                Plugin.Log.LogInfo("[AutoLoad] Starting server NOW via DirectConnectManager...");
+
+                // Actually start the server
+                DirectConnectManager.StartServer();
+
+                Plugin.Log.LogInfo("[AutoLoad] Server start initiated!");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[AutoLoad] TriggerServerStartNow error: {ex}");
+                // Reschedule on error
+                if (_serverStartAttempts < 30)
+                {
+                    _serverStartScheduledDateTime = DateTime.UtcNow.AddSeconds(5);
+                    _serverStartPending = true;
+                }
+            }
+        }
 
         private static int _serverStartAttempts = 0;
 
@@ -53,7 +159,7 @@ namespace TechtonicaDedicatedServer.Networking
         private static float _mainMenuStuckStartTime;
         private static bool _mainMenuStuckMonitorActive;
         private static bool _forcedMainMenuBypass;
-        private const float MAIN_MENU_TIMEOUT_SECONDS = 10f;
+        private const float MAIN_MENU_TIMEOUT_SECONDS = 120f; // Give sync scene loading time to work
 
         /// <summary>
         /// Called from Plugin.Update() to handle scheduled server start on main thread.
@@ -363,52 +469,13 @@ namespace TechtonicaDedicatedServer.Networking
         {
             try
             {
-                Plugin.Log.LogInfo("[AutoNavigate] Force-starting HOST from Main Menu...");
+                Plugin.Log.LogInfo("[AutoNavigate] Force-starting HOST from Main Menu using DirectConnectManager...");
 
-                // CRITICAL: Set up KCP transport before starting the host
-                // FizzyFacepunch (Steam) won't work without Steam
-                SetupKCPTransport();
-
-                var networkManager = Mirror.NetworkManager.singleton;
-                if (networkManager == null)
+                // Use DirectConnectManager.StartHost() which has the working transport setup
+                // This ensures the KCP transport is properly configured for Wine
+                if (DirectConnectManager.StartHost())
                 {
-                    Plugin.Log.LogError("[AutoNavigate] Could not find NetworkManager.singleton!");
-                    return;
-                }
-
-                Plugin.Log.LogInfo($"[AutoNavigate] Found NetworkManager: {networkManager.GetType().Name}");
-
-                // Set the network address
-                networkManager.networkAddress = "0.0.0.0";
-
-                // Get the port from our config
-                ushort port = (ushort)Plugin.ServerPort.Value;
-
-                // Set the transport port
-                var transport = Mirror.Transport.activeTransport;
-                if (transport != null)
-                {
-                    Plugin.Log.LogInfo($"[AutoNavigate] Active transport: {transport.GetType().Name}");
-
-                    var portField = transport.GetType().GetField("Port", BindingFlags.Public | BindingFlags.Instance);
-                    var portProp = transport.GetType().GetProperty("Port", BindingFlags.Public | BindingFlags.Instance);
-
-                    if (portField != null)
-                        portField.SetValue(transport, port);
-                    else if (portProp != null)
-                        portProp.SetValue(transport, port);
-
-                    Plugin.Log.LogInfo($"[AutoNavigate] Set transport port to {port}");
-                }
-
-                // Start as host
-                networkManager.StartHost();
-                Plugin.Log.LogInfo("[AutoNavigate] StartHost() called!");
-
-                // Check if server started
-                if (Mirror.NetworkServer.active)
-                {
-                    Plugin.Log.LogInfo($"[AutoNavigate] HOST STARTED on port {port}!");
+                    Plugin.Log.LogInfo($"[AutoNavigate] HOST STARTED via DirectConnectManager!");
 
                     // CRITICAL: Spawn NetworkMessageRelay for game commands to work
                     SpawnNetworkMessageRelay();
@@ -418,7 +485,25 @@ namespace TechtonicaDedicatedServer.Networking
                 }
                 else
                 {
-                    Plugin.Log.LogWarning("[AutoNavigate] StartHost called but NetworkServer.active is false");
+                    Plugin.Log.LogError("[AutoNavigate] DirectConnectManager.StartHost() failed!");
+
+                    // Fallback to direct setup
+                    Plugin.Log.LogInfo("[AutoNavigate] Attempting fallback direct setup...");
+                    SetupKCPTransport();
+
+                    var networkManager = Mirror.NetworkManager.singleton;
+                    if (networkManager != null)
+                    {
+                        networkManager.networkAddress = "0.0.0.0";
+                        networkManager.StartHost();
+
+                        if (Mirror.NetworkServer.active)
+                        {
+                            Plugin.Log.LogInfo("[AutoNavigate] Fallback HOST started!");
+                            SpawnNetworkMessageRelay();
+                            CreateStubGameSystems();
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -540,6 +625,66 @@ namespace TechtonicaDedicatedServer.Networking
                 // Add NetworkMessageRelay component
                 var relay = go.AddComponent(relayType);
 
+                // CRITICAL: Manually set the netIdentity backing field on the NetworkBehaviour
+                // When adding components at runtime, the caching doesn't happen automatically
+                var netIdentityField = typeof(Mirror.NetworkBehaviour).GetField("<netIdentity>k__BackingField",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (netIdentityField != null)
+                {
+                    netIdentityField.SetValue(relay, networkIdentity);
+                    Plugin.Log.LogInfo("[AutoNavigate] Set netIdentity backing field on NetworkMessageRelay");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] Could not find netIdentity backing field!");
+                }
+
+                // CRITICAL: Set up the NetworkBehaviours array on the NetworkIdentity
+                // This is normally done in Awake() by InitializeNetworkBehaviours()
+                // Without this, Mirror can't find component [0] for RPCs
+                var networkBehavioursProperty = typeof(Mirror.NetworkIdentity).GetProperty("NetworkBehaviours",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (networkBehavioursProperty != null)
+                {
+                    var setter = networkBehavioursProperty.GetSetMethod(true);
+                    if (setter != null)
+                    {
+                        var behaviours = new Mirror.NetworkBehaviour[] { relay as Mirror.NetworkBehaviour };
+                        setter.Invoke(networkIdentity, new object[] { behaviours });
+                        Plugin.Log.LogInfo("[AutoNavigate] Set NetworkBehaviours array on identity");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[AutoNavigate] Could not get NetworkBehaviours setter!");
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] Could not find NetworkBehaviours property!");
+                }
+
+                // CRITICAL: Set ComponentIndex on the relay
+                // This tells Mirror which index this behaviour is in the array
+                var componentIndexProp = typeof(Mirror.NetworkBehaviour).GetProperty("ComponentIndex",
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (componentIndexProp != null)
+                {
+                    var setter = componentIndexProp.GetSetMethod(true);
+                    if (setter != null)
+                    {
+                        setter.Invoke(relay, new object[] { (byte)0 });
+                        Plugin.Log.LogInfo("[AutoNavigate] Set ComponentIndex = 0 on relay");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[AutoNavigate] Could not get ComponentIndex setter!");
+                    }
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[AutoNavigate] Could not find ComponentIndex property!");
+                }
+
                 // Set the static instance
                 if (instanceField != null)
                 {
@@ -551,7 +696,37 @@ namespace TechtonicaDedicatedServer.Networking
                 if (Mirror.NetworkServer.active)
                 {
                     Mirror.NetworkServer.Spawn(go);
-                    Plugin.Log.LogInfo("[AutoNavigate] NetworkMessageRelay spawned on network!");
+                    Plugin.Log.LogInfo($"[AutoNavigate] NetworkMessageRelay spawned on network with netId={networkIdentity.netId}");
+
+                    // CRITICAL: Clients send commands with netId=1, so we need to register this identity
+                    // with netId=1 in the spawned dictionary as an alias
+                    if (networkIdentity.netId != 1)
+                    {
+                        if (!Mirror.NetworkServer.spawned.ContainsKey(1))
+                        {
+                            Mirror.NetworkServer.spawned[1] = networkIdentity;
+                            Plugin.Log.LogInfo("[AutoNavigate] Added NetworkMessageRelay to NetworkServer.spawned[1] as alias");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning($"[AutoNavigate] NetworkServer.spawned[1] already contains: {Mirror.NetworkServer.spawned[1]?.gameObject?.name}");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Log.LogInfo("[AutoNavigate] NetworkMessageRelay already has netId=1");
+                    }
+
+                    // Log the spawned dictionary for debugging
+                    Plugin.Log.LogInfo($"[AutoNavigate] NetworkServer.spawned count: {Mirror.NetworkServer.spawned.Count}");
+                    foreach (var kvp in Mirror.NetworkServer.spawned)
+                    {
+                        if (kvp.Key <= 5) // Only log first few entries
+                        {
+                            var objName = kvp.Value?.gameObject?.name ?? "null";
+                            Plugin.Log.LogInfo($"[AutoNavigate]   spawned[{kvp.Key}] = {objName}");
+                        }
+                    }
                 }
 
                 _serverNetworkRelay = relay;
@@ -921,6 +1096,39 @@ namespace TechtonicaDedicatedServer.Networking
                     {
                         Plugin.Log.LogError($"[AutoNavigate] UI Scene load failed: {ex.Message}");
                     }
+                }
+
+                // CRITICAL: Set Player Scene as active scene to exit Loading screen
+                Plugin.Log.LogInfo("[AutoNavigate] About to set active scene...");
+                try
+                {
+                    sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                    Plugin.Log.LogInfo($"[AutoNavigate] Looking for Player Scene in {sceneCount} scenes...");
+                    bool foundPlayerScene = false;
+                    for (int i = 0; i < sceneCount; i++)
+                    {
+                        var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                        if (scene.name == "Player Scene")
+                        {
+                            Plugin.Log.LogInfo($"[AutoNavigate] Found Player Scene at index {i}, isLoaded={scene.isLoaded}");
+                            if (scene.isLoaded)
+                            {
+                                Plugin.Log.LogInfo("[AutoNavigate] Setting Player Scene as active scene...");
+                                UnityEngine.SceneManagement.SceneManager.SetActiveScene(scene);
+                                Plugin.Log.LogInfo("[AutoNavigate] Player Scene is now the active scene!");
+                                foundPlayerScene = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!foundPlayerScene)
+                    {
+                        Plugin.Log.LogWarning("[AutoNavigate] Could not find loaded Player Scene to set as active!");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogError($"[AutoNavigate] SetActiveScene failed: {ex.Message}\n{ex.StackTrace}");
                 }
             }
             catch (Exception ex)
@@ -1327,6 +1535,7 @@ namespace TechtonicaDedicatedServer.Networking
                 // Start the server after a short delay (no scene loading needed in headless mode)
                 Plugin.DebugLog("[AutoLoad-Direct] Scheduling server start in 5 seconds...");
                 _serverStartScheduledTime = Time.realtimeSinceStartup + 5f;
+                _serverStartScheduledDateTime = DateTime.UtcNow.AddSeconds(5); // Thread-safe alternative
                 _serverStartPending = true;
             }
             catch (Exception ex)

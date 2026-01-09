@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.0.72
+- **FIX**: Fixed "Ambiguous match found" error in HitDestructibleInfo - now uses actual resource type for method lookup
+- **FIX**: MOLE ore mining now works - prefix sets canMineOre=true so client can determine ore locally
+- **FIX**: Improved type lookups - now tries CraftActionInfo, SimpleBuildActionInfo, ExchangeMachineActionInfo first
+- **FIX**: Removed broken fallback code that could throw AmbiguousMatchException
+- Plants and destructibles should now properly drop items to inventory
+- MOLE should now properly mine ore and add to inventory
+
+## 1.0.63
+- **NEW**: Added ExchangeMachineInfo handler for single item clicks in storage
+- When clicking individual items in storage, items now properly transfer to player inventory
+- Fixed items disappearing when clicking stacks in storage containers
+
+## 1.0.62
+- **FIX**: ResourceStack.info is a PROPERTY, not a field - use GetProperty() instead of GetField()
+- This fixes items showing `info=False` and not being added to inventory
+- Items taken from machines should now properly appear in player inventory
+
+## 1.0.61
+- **FIX**: Use NetworkClient.localPlayer to get Player in multiplayer (Player.instance is null)
+- Try multiple methods: Player.instance, NetworkClient.localPlayer, FindObjectOfType
+
+## 1.0.60
+- **DEBUG**: Detailed logging for Player.instance, inventory, and AddResources calls
+
+## 1.0.59
+- **DEBUG**: More detailed logging in TakeAll and HitDestructible to trace item retrieval
+
+## 1.0.58
+- **DEBUG**: Added logging to TakeAllInfo and HitDestructibleInfo prefixes to diagnose inventory sync
+
+## 1.0.57
+- **NEW**: Client-side inventory synchronization for headless server compatibility
+- Patches TakeAllInfo.ProcessOnClient to add items to local inventory when taking from machines
+- Patches HitDestructibleInfo.ProcessOnClient to add drops to inventory when destroying props
+- Stub patches for MOLEActionInfo, CraftCommand, SimpleBuildInfo (future implementation)
+- Uses "trust the client" model since headless server can't calculate inventory changes
+
+## 1.0.56
+- **FIX**: Use correct netId=2 for server relay (not 1)
+- Server's spawned dictionary: [1]=Player Cheats, [2]=MachineMessageRelay
+- Client now correctly routes commands to netId=2 where the relay actually is
+- This should finally fix pickup, mining, building, crafting
+
+## 1.0.55
+- **FIX**: Force client's relay netId to 1 to match server
+- Client scene relay has netId=2, server relay has netId=1 - commands weren't routing
+- Now fixes netId before sending ANY network action
+- Added debug logging to confirm SendNetworkAction is triggered
+- This should finally fix pickup, mining, building, crafting
+
+## 1.0.54
+- Version bump to force fresh download (v1.0.53 was getting cached)
+- Same fix as v1.0.53: Add prefix to SendNetworkAction to fix connectionToServer
+
+## 1.0.53
+- **FIX**: Add prefix to SendNetworkAction to fix connectionToServer before commands
+- connectionToServer was null on client's NetworkIdentity, preventing all game commands
+- Now sets connectionToServer via reflection before any network action is sent
+- This should fix pickup, mining, building, and crafting
+
+## 1.0.52
+- **CRITICAL FIX**: Set NetworkBehaviours array and ComponentIndex on NetworkIdentity
+- Mirror requires `NetworkIdentity.NetworkBehaviours` array to be populated for RPC routing
+- This is normally done in `Awake()` by `InitializeNetworkBehaviours()`, but runtime components miss this
+- Now explicitly sets `NetworkBehaviours = [relay]` and `ComponentIndex = 0` on the relay
+- This fixes "Component [0] not found for [netId=1]" warning
+- Combined with v1.0.51's netIdentity backing field fix, Mirror should now route all RPCs correctly
+- **This should enable game interactions (pickup, mine, build, craft, inventory sync)**
+
+## 1.0.51
+- **CRITICAL FIX**: Manually set netIdentity backing field on NetworkBehaviour
+- When adding NetworkBehaviour components at runtime, Mirror's caching doesn't work
+- Now explicitly sets `<netIdentity>k__BackingField` on the NetworkMessageRelay
+- This fixes "Object reference not set" errors in SendTargetRPCInternal
+- Server and client both now properly link NetworkIdentity to NetworkBehaviour
+- **This should finally fix game interactions (pickup, mine, build, craft)**
+
 ## 1.0.50
 - **FIX**: Server now proactively pushes tick to new clients on connect
 - This bypasses the broken client->server RequestCurrentSimTick command flow
@@ -266,3 +344,4 @@
 - In-game UI with F8 hotkey
 - KCP transport for reliable UDP connections
 - Auto-saves last connected server
+

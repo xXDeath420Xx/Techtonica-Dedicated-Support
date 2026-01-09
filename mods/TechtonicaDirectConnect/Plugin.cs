@@ -91,6 +91,9 @@ namespace TechtonicaDirectConnect
             // Apply null safety patches for networked player objects
             NullSafetyPatches.ApplyPatches(_harmony);
 
+            // Apply inventory sync patches for headless server compatibility
+            InventorySyncPatches.ApplyPatches(_harmony);
+
             Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] v{PluginInfo.PLUGIN_VERSION} loaded!");
             Log.LogInfo($"[{PluginInfo.PLUGIN_NAME}] Press F11 to open connect dialog");
         }
@@ -1060,7 +1063,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.50";
+        public const string PLUGIN_VERSION = "1.0.71";
     }
 
     /// <summary>
@@ -1180,6 +1183,66 @@ namespace TechtonicaDirectConnect
 
                     // Add the relay component
                     relay = relayGO.AddComponent(relayType);
+
+                    // CRITICAL: Manually set the netIdentity backing field on the NetworkBehaviour
+                    // When adding components at runtime, the caching doesn't happen automatically
+                    var netIdentityField = typeof(NetworkBehaviour).GetField("<netIdentity>k__BackingField",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (netIdentityField != null)
+                    {
+                        netIdentityField.SetValue(relay, identity);
+                        Plugin.Log.LogInfo($"[DirectConnect] Set netIdentity backing field on relay");
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[DirectConnect] Could not find netIdentity backing field!");
+                    }
+
+                    // CRITICAL: Set up the NetworkBehaviours array on the NetworkIdentity
+                    // This is normally done in Awake() by InitializeNetworkBehaviours()
+                    // Without this, Mirror can't find component [0] for RPCs
+                    var networkBehavioursProperty = typeof(NetworkIdentity).GetProperty("NetworkBehaviours",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (networkBehavioursProperty != null)
+                    {
+                        var setter = networkBehavioursProperty.GetSetMethod(true);
+                        if (setter != null)
+                        {
+                            var behaviours = new NetworkBehaviour[] { relay as NetworkBehaviour };
+                            setter.Invoke(identity, new object[] { behaviours });
+                            Plugin.Log.LogInfo($"[DirectConnect] Set NetworkBehaviours array on identity");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning("[DirectConnect] Could not get NetworkBehaviours setter!");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[DirectConnect] Could not find NetworkBehaviours property!");
+                    }
+
+                    // CRITICAL: Set ComponentIndex on the relay
+                    // This tells Mirror which index this behaviour is in the array
+                    var componentIndexProp = typeof(NetworkBehaviour).GetProperty("ComponentIndex",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (componentIndexProp != null)
+                    {
+                        var setter = componentIndexProp.GetSetMethod(true);
+                        if (setter != null)
+                        {
+                            setter.Invoke(relay, new object[] { (byte)0 });
+                            Plugin.Log.LogInfo($"[DirectConnect] Set ComponentIndex = 0 on relay");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning("[DirectConnect] Could not get ComponentIndex setter!");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Log.LogWarning("[DirectConnect] Could not find ComponentIndex property!");
+                    }
 
                     Plugin.Log.LogInfo($"[DirectConnect] Created NetworkMessageRelay with NetworkIdentity");
                 }
@@ -1454,9 +1517,10 @@ namespace TechtonicaDirectConnect
                     var sendMethod = AccessTools.Method(networkRelayType, "SendNetworkAction");
                     if (sendMethod != null)
                     {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(SendNetworkAction_Prefix));
                         var finalizer = new HarmonyMethod(typeof(NullSafetyPatches), nameof(SuppressException_Finalizer));
-                        harmony.Patch(sendMethod, finalizer: finalizer);
-                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.SendNetworkAction with finalizer");
+                        harmony.Patch(sendMethod, prefix: prefix, finalizer: finalizer);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkMessageRelay.SendNetworkAction with prefix and finalizer");
                     }
 
                     // Patch RequestCurrentSimTick - server might not have NetworkMessageRelay on dedicated servers
@@ -1480,6 +1544,138 @@ namespace TechtonicaDirectConnect
                     }
                 }
 
+                // Patch NetworkedPlayer.OnStopClient to track disconnects
+                var networkedPlayerType = AccessTools.TypeByName("NetworkedPlayer");
+                if (networkedPlayerType != null)
+                {
+                    var onStopClientMethod = AccessTools.Method(networkedPlayerType, "OnStopClient");
+                    if (onStopClientMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(OnStopClient_Prefix));
+                        harmony.Patch(onStopClientMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkedPlayer.OnStopClient for disconnect tracking");
+                    }
+                }
+
+                // Patch NetworkManager.OnClientDisconnect for more info
+                var networkManagerType = typeof(Mirror.NetworkManager);
+                var onClientDisconnectMethod = AccessTools.Method(networkManagerType, "OnClientDisconnect");
+                if (onClientDisconnectMethod != null)
+                {
+                    var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(OnClientDisconnect_Prefix));
+                    harmony.Patch(onClientDisconnectMethod, prefix: prefix);
+                    Plugin.Log.LogInfo("[DirectConnect] Patched NetworkManager.OnClientDisconnect for disconnect tracking");
+                }
+
+                // AGGRESSIVE LOGGING: Wrap each patch in try-catch so one failure doesn't stop others
+
+                // Patch NetworkClient.OnSpawn to log ALL spawns
+                try
+                {
+                    var onSpawnMethod = typeof(Mirror.NetworkClient).GetMethod("OnObjectSpawn", BindingFlags.NonPublic | BindingFlags.Static);
+                    if (onSpawnMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(OnObjectSpawn_Prefix));
+                        harmony.Patch(onSpawnMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkClient.OnObjectSpawn for spawn tracking");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch OnObjectSpawn: {ex.Message}"); }
+
+                // Patch NetworkClient.OnObjectDestroy
+                try
+                {
+                    var onDestroyMethod = typeof(Mirror.NetworkClient).GetMethod("OnObjectDestroy", BindingFlags.NonPublic | BindingFlags.Static);
+                    if (onDestroyMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(OnObjectDestroy_Prefix));
+                        harmony.Patch(onDestroyMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkClient.OnObjectDestroy for destroy tracking");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch OnObjectDestroy: {ex.Message}"); }
+
+                // Patch NetworkIdentity.HandleRemoteCall (all RPCs)
+                try
+                {
+                    var handleRemoteCallMethod = typeof(Mirror.NetworkIdentity).GetMethod("HandleRemoteCall", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (handleRemoteCallMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(HandleRemoteCall_Prefix));
+                        harmony.Patch(handleRemoteCallMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkIdentity.HandleRemoteCall for RPC tracking");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch HandleRemoteCall: {ex.Message}"); }
+
+                // Patch NetworkClient.Connect
+                try
+                {
+                    var connectMethod = typeof(Mirror.NetworkClient).GetMethod("Connect", new Type[] { typeof(string) });
+                    if (connectMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(NetworkClient_Connect_Prefix));
+                        harmony.Patch(connectMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched NetworkClient.Connect");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch NetworkClient.Connect: {ex.Message}"); }
+
+                // Patch KCP transport events
+                try
+                {
+                    var kcpTransportType = typeof(kcp2k.KcpTransport);
+                    var onClientConnectedMethod = kcpTransportType.GetMethod("OnClientConnected", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (onClientConnectedMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(KCP_OnClientConnected_Prefix));
+                        harmony.Patch(onClientConnectedMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched KcpTransport.OnClientConnected");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch KcpTransport.OnClientConnected: {ex.Message}"); }
+
+                try
+                {
+                    var kcpTransportType = typeof(kcp2k.KcpTransport);
+                    var onClientDisconnectedMethod = kcpTransportType.GetMethod("OnClientDisconnected", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (onClientDisconnectedMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(KCP_OnClientDisconnected_Prefix));
+                        harmony.Patch(onClientDisconnectedMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched KcpTransport.OnClientDisconnected");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch KcpTransport.OnClientDisconnected: {ex.Message}"); }
+
+                // Patch KcpClient.Disconnect to log reason
+                try
+                {
+                    var kcpClientType = typeof(kcp2k.KcpClient);
+                    var kcpClientDisconnectMethod = kcpClientType.GetMethod("Disconnect", BindingFlags.Public | BindingFlags.Instance);
+                    if (kcpClientDisconnectMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(KcpClient_Disconnect_Prefix));
+                        harmony.Patch(kcpClientDisconnectMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched KcpClient.Disconnect");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch KcpClient.Disconnect: {ex.Message}"); }
+
+                // Patch KcpConnection.Disconnect to catch the reason
+                try
+                {
+                    var kcpConnectionType = typeof(kcp2k.KcpConnection);
+                    var kcpConnectionDisconnectMethod = kcpConnectionType.GetMethod("Disconnect", BindingFlags.Public | BindingFlags.Instance);
+                    if (kcpConnectionDisconnectMethod != null)
+                    {
+                        var prefix = new HarmonyMethod(typeof(NullSafetyPatches), nameof(KcpConnection_Disconnect_Prefix));
+                        harmony.Patch(kcpConnectionDisconnectMethod, prefix: prefix);
+                        Plugin.Log.LogInfo("[DirectConnect] Patched KcpConnection.Disconnect");
+                    }
+                }
+                catch (Exception ex) { Plugin.Log.LogWarning($"[DirectConnect] Failed to patch KcpConnection.Disconnect: {ex.Message}"); }
+
                 _patchesApplied = true;
             }
             catch (Exception ex)
@@ -1494,6 +1690,67 @@ namespace TechtonicaDirectConnect
         public static bool Skip_Prefix()
         {
             return false;
+        }
+
+        /// <summary>
+        /// Prefix for SendNetworkAction - fixes connectionToServer and netId before command is sent
+        /// </summary>
+        public static void SendNetworkAction_Prefix(object __instance, object action)
+        {
+            try
+            {
+                var behaviour = __instance as NetworkBehaviour;
+                var identity = behaviour?.netIdentity;
+
+                // ALWAYS log when this is called to confirm it triggers
+                Plugin.Log.LogInfo($"[DirectConnect] SendNetworkAction called! Action: {action?.GetType()?.Name ?? "null"}");
+
+                if (identity == null)
+                {
+                    Plugin.Log.LogWarning($"[DirectConnect] SendNetworkAction: netIdentity is NULL!");
+                    return;
+                }
+
+                Plugin.Log.LogInfo($"[DirectConnect] SendNetworkAction: netId={identity.netId}, connToServer={identity.connectionToServer != null}");
+
+                // Fix connectionToServer if needed
+                if (identity.connectionToServer == null && NetworkClient.connection != null)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] SendNetworkAction: Fixing connectionToServer...");
+                    TrySetConnectionToServer(identity);
+                }
+
+                // CRITICAL: Fix netId if it doesn't match server's relay (netId=2)
+                // The server's NetworkMessageRelay (MachineMessageRelay) has netId=2
+                // spawned[1] = Player Cheats, spawned[2] = MachineMessageRelay
+                if (identity.netId != 2)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] SendNetworkAction: Fixing netId from {identity.netId} to 2...");
+                    var netIdField = typeof(NetworkIdentity).GetField("_netId", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (netIdField != null)
+                    {
+                        netIdField.SetValue(identity, (uint)2);
+                        Plugin.Log.LogInfo($"[DirectConnect] Set netId = 2");
+                    }
+                    else
+                    {
+                        var netIdProp = typeof(NetworkIdentity).GetProperty("netId", BindingFlags.Public | BindingFlags.Instance);
+                        if (netIdProp != null)
+                        {
+                            var setter = netIdProp.GetSetMethod(true);
+                            if (setter != null)
+                            {
+                                setter.Invoke(identity, new object[] { (uint)2 });
+                                Plugin.Log.LogInfo($"[DirectConnect] Set netId = 2 via property");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[DirectConnect] SendNetworkAction_Prefix error: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -1548,6 +1805,13 @@ namespace TechtonicaDirectConnect
                 {
                     Plugin.Log.LogInfo($"[DirectConnect]   NetworkClient.connection.isReady: {NetworkClient.connection.isReady}");
                 }
+
+                // FIX: If connectionToServer is null but we have a valid NetworkClient.connection, set it!
+                if (identity != null && identity.connectionToServer == null && NetworkClient.connection != null)
+                {
+                    Plugin.Log.LogInfo($"[DirectConnect] FIXING: connectionToServer is null, setting to NetworkClient.connection...");
+                    TrySetConnectionToServer(identity);
+                }
             }
             catch (Exception ex)
             {
@@ -1589,11 +1853,34 @@ namespace TechtonicaDirectConnect
         ///   FactorySimManager.instance.HandleServerTimeSync(tick);
         /// But FactorySimManager.instance might be null on client.
         /// </summary>
+        private static bool _saveLoaded = false;
+
         public static bool ProcessCurrentSimTick_Prefix(int tick)
         {
             try
             {
                 Plugin.Log.LogInfo($"[DirectConnect] ProcessCurrentSimTick received tick={tick}");
+
+                // Check if save has loaded by looking at SaveState.instance
+                var saveStateType = AccessTools.TypeByName("SaveState");
+                var saveStateInstance = saveStateType?.GetProperty("instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+
+                if (saveStateInstance == null)
+                {
+                    Plugin.Log.LogWarning($"[DirectConnect] ProcessCurrentSimTick: SaveState.instance is null - game not ready, skipping tick sync");
+                    return false;
+                }
+
+                // Check if MachineManager has been initialized (has valid machineDefinitions)
+                var machineManagerType = AccessTools.TypeByName("MachineManager");
+                var mmInstanceField = machineManagerType?.GetField("instance", BindingFlags.Public | BindingFlags.Static);
+                var mmInstance = mmInstanceField?.GetValue(null);
+
+                if (mmInstance == null)
+                {
+                    Plugin.Log.LogWarning($"[DirectConnect] ProcessCurrentSimTick: MachineManager.instance is null - game not ready, skipping tick sync");
+                    return false;
+                }
 
                 // Try to call HandleServerTimeSync if FactorySimManager.instance exists
                 var factorySimType = AccessTools.TypeByName("FactorySimManager");
@@ -1605,12 +1892,25 @@ namespace TechtonicaDirectConnect
                         var fsmInstance = instanceProp.GetValue(null);
                         if (fsmInstance != null)
                         {
+                            // Additional check: make sure _needInit is false
+                            var needInitField = factorySimType.GetField("_needInit", BindingFlags.NonPublic | BindingFlags.Instance);
+                            if (needInitField != null)
+                            {
+                                bool needInit = (bool)needInitField.GetValue(fsmInstance);
+                                if (needInit)
+                                {
+                                    Plugin.Log.LogWarning($"[DirectConnect] ProcessCurrentSimTick: FactorySimManager still needs init - skipping tick sync");
+                                    return false;
+                                }
+                            }
+
                             var handleMethod = factorySimType.GetMethod("HandleServerTimeSync",
                                 BindingFlags.Public | BindingFlags.Instance);
                             if (handleMethod != null)
                             {
                                 handleMethod.Invoke(fsmInstance, new object[] { tick });
                                 Plugin.Log.LogInfo($"[DirectConnect] Successfully synced tick to {tick}");
+                                _saveLoaded = true;
                                 return false; // Skip original - we handled it
                             }
                         }
@@ -1621,23 +1921,14 @@ namespace TechtonicaDirectConnect
                     }
                 }
 
-                // Also try to set MachineManager.instance.curTick if it exists
-                var machineManagerType = AccessTools.TypeByName("MachineManager");
-                if (machineManagerType != null)
+                // Also set MachineManager.instance.curTick directly (already have mmInstance from check above)
+                if (mmInstance != null)
                 {
-                    var mmInstanceField = machineManagerType.GetField("instance", BindingFlags.Public | BindingFlags.Static);
-                    if (mmInstanceField != null)
+                    var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
+                    if (curTickField != null)
                     {
-                        var mmInstance = mmInstanceField.GetValue(null);
-                        if (mmInstance != null)
-                        {
-                            var curTickField = machineManagerType.GetField("curTick", BindingFlags.Public | BindingFlags.Instance);
-                            if (curTickField != null)
-                            {
-                                curTickField.SetValue(mmInstance, tick);
-                                Plugin.Log.LogInfo($"[DirectConnect] Set MachineManager.curTick = {tick}");
-                            }
-                        }
+                        curTickField.SetValue(mmInstance, tick);
+                        Plugin.Log.LogInfo($"[DirectConnect] Set MachineManager.curTick = {tick}");
                     }
                 }
 
@@ -1645,8 +1936,244 @@ namespace TechtonicaDirectConnect
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError($"[DirectConnect] ProcessCurrentSimTick error: {ex.Message}");
+                // Log full exception details including inner exception
+                var innerMsg = ex.InnerException?.Message ?? "no inner";
+                var innerStack = ex.InnerException?.StackTrace ?? "";
+                Plugin.Log.LogError($"[DirectConnect] ProcessCurrentSimTick error: {ex.Message} | Inner: {innerMsg}");
+                if (!string.IsNullOrEmpty(innerStack))
+                {
+                    Plugin.Log.LogError($"[DirectConnect] Inner stack: {innerStack}");
+                }
                 return false; // Skip original to prevent crash
+            }
+        }
+
+        /// <summary>
+        /// Track NetworkedPlayer.OnStopClient to understand disconnect causes.
+        /// </summary>
+        public static void OnStopClient_Prefix(object __instance)
+        {
+            try
+            {
+                var netId = __instance.GetType().GetProperty("netId")?.GetValue(__instance);
+                var isLocalPlayer = __instance.GetType().GetProperty("isLocalPlayer")?.GetValue(__instance);
+
+                Plugin.Log.LogWarning($"[DirectConnect] DISCONNECT TRACKING: NetworkedPlayer.OnStopClient called! netId={netId}, isLocalPlayer={isLocalPlayer}");
+
+                // Log stack trace to see what called this
+                var stackTrace = new System.Diagnostics.StackTrace(true);
+                var frames = stackTrace.GetFrames();
+                if (frames != null)
+                {
+                    var traceStr = "";
+                    for (int i = 0; i < Math.Min(frames.Length, 15); i++)
+                    {
+                        var frame = frames[i];
+                        var method = frame.GetMethod();
+                        if (method != null)
+                        {
+                            traceStr += $"{method.DeclaringType?.Name}.{method.Name} -> ";
+                        }
+                    }
+                    Plugin.Log.LogWarning($"[DirectConnect] DISCONNECT STACK: {traceStr}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[DirectConnect] OnStopClient_Prefix error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Track NetworkManager.OnClientDisconnect for disconnect causes.
+        /// </summary>
+        public static void OnClientDisconnect_Prefix()
+        {
+            Plugin.Log.LogWarning("[DirectConnect] DISCONNECT TRACKING: NetworkManager.OnClientDisconnect called!");
+
+            // Log stack trace
+            try
+            {
+                var stackTrace = new System.Diagnostics.StackTrace(true);
+                var frames = stackTrace.GetFrames();
+                if (frames != null)
+                {
+                    var traceStr = "";
+                    for (int i = 0; i < Math.Min(frames.Length, 15); i++)
+                    {
+                        var frame = frames[i];
+                        var method = frame.GetMethod();
+                        if (method != null)
+                        {
+                            traceStr += $"{method.DeclaringType?.Name}.{method.Name} -> ";
+                        }
+                    }
+                    Plugin.Log.LogWarning($"[DirectConnect] DISCONNECT MANAGER STACK: {traceStr}");
+                }
+            }
+            catch { }
+        }
+
+        // =========== AGGRESSIVE LOGGING HANDLERS ===========
+
+        public static void OnObjectSpawn_Prefix(Mirror.SpawnMessage msg)
+        {
+            Plugin.Log.LogInfo($"[NETWORK] SPAWN: netId={msg.netId}, isLocalPlayer={msg.isLocalPlayer}, isOwner={msg.isOwner}, sceneId={msg.sceneId:X16}, assetId={msg.assetId}");
+        }
+
+        public static void OnObjectDestroy_Prefix(Mirror.ObjectDestroyMessage message)
+        {
+            Plugin.Log.LogWarning($"[NETWORK] DESTROY: netId={message.netId}");
+        }
+
+        public static void HandleRemoteCall_Prefix(object __instance, int componentIndex, int functionHash, object invokeType, object reader, object senderConnection)
+        {
+            var identity = __instance as NetworkIdentity;
+            Plugin.Log.LogInfo($"[NETWORK] RPC: netId={identity?.netId}, componentIndex={componentIndex}, functionHash={functionHash}, type={invokeType}");
+        }
+
+        public static void NetworkClient_Connect_Prefix(string address)
+        {
+            Plugin.Log.LogInfo($"[NETWORK] CONNECT: Connecting to {address}");
+        }
+
+        public static void KCP_OnClientConnected_Prefix()
+        {
+            Plugin.Log.LogInfo("[NETWORK] KCP: Client connected at transport level!");
+        }
+
+        public static void KCP_OnClientDisconnected_Prefix()
+        {
+            Plugin.Log.LogError("[NETWORK] KCP: Client DISCONNECTED at transport level!");
+
+            // Log stack trace to see what triggered the transport disconnect
+            try
+            {
+                var stackTrace = new System.Diagnostics.StackTrace(true);
+                var frames = stackTrace.GetFrames();
+                if (frames != null)
+                {
+                    var traceStr = "";
+                    for (int i = 0; i < Math.Min(frames.Length, 20); i++)
+                    {
+                        var frame = frames[i];
+                        var method = frame.GetMethod();
+                        if (method != null)
+                        {
+                            traceStr += $"{method.DeclaringType?.Name}.{method.Name} -> ";
+                        }
+                    }
+                    Plugin.Log.LogError($"[NETWORK] KCP DISCONNECT STACK: {traceStr}");
+                }
+            }
+            catch { }
+        }
+
+        public static void KcpClient_Disconnect_Prefix(object __instance)
+        {
+            Plugin.Log.LogError($"[NETWORK] KcpClient.Disconnect called!");
+
+            // Log stack trace to understand why
+            try
+            {
+                var stackTrace = new System.Diagnostics.StackTrace(true);
+                var frames = stackTrace.GetFrames();
+                if (frames != null)
+                {
+                    var traceStr = "";
+                    for (int i = 0; i < Math.Min(frames.Length, 25); i++)
+                    {
+                        var frame = frames[i];
+                        var method = frame.GetMethod();
+                        if (method != null)
+                        {
+                            traceStr += $"{method.DeclaringType?.Name}.{method.Name} -> ";
+                        }
+                    }
+                    Plugin.Log.LogError($"[NETWORK] KcpClient.Disconnect STACK: {traceStr}");
+                }
+            }
+            catch { }
+        }
+
+        public static void KcpConnection_Disconnect_Prefix(object __instance)
+        {
+            Plugin.Log.LogError($"[NETWORK] KcpConnection.Disconnect called!");
+
+            // Try to get the state/reason from the connection
+            try
+            {
+                var connType = __instance.GetType();
+                var stateField = connType.GetField("state", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var state = stateField?.GetValue(__instance);
+                Plugin.Log.LogError($"[NETWORK] KcpConnection state before disconnect: {state}");
+
+                // Log stack trace
+                var stackTrace = new System.Diagnostics.StackTrace(true);
+                var frames = stackTrace.GetFrames();
+                if (frames != null)
+                {
+                    var traceStr = "";
+                    for (int i = 0; i < Math.Min(frames.Length, 30); i++)
+                    {
+                        var frame = frames[i];
+                        var method = frame.GetMethod();
+                        if (method != null)
+                        {
+                            traceStr += $"{method.DeclaringType?.Name}.{method.Name} -> ";
+                        }
+                    }
+                    Plugin.Log.LogError($"[NETWORK] KcpConnection.Disconnect STACK: {traceStr}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[NETWORK] KcpConnection logging error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Sets connectionToServer on a NetworkIdentity using reflection.
+        /// This is needed for client commands to work on server-spawned objects.
+        /// </summary>
+        private static void TrySetConnectionToServer(NetworkIdentity identity)
+        {
+            if (identity == null || NetworkClient.connection == null) return;
+
+            try
+            {
+                // connectionToServer is a property with internal setter
+                var connectionToServerProp = typeof(NetworkIdentity).GetProperty("connectionToServer",
+                    BindingFlags.Public | BindingFlags.Instance);
+
+                if (connectionToServerProp != null)
+                {
+                    var setter = connectionToServerProp.GetSetMethod(true);
+                    if (setter != null)
+                    {
+                        setter.Invoke(identity, new object[] { NetworkClient.connection });
+                        Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer via setter");
+                    }
+                    else
+                    {
+                        // Try the backing field directly
+                        var backingField = typeof(NetworkIdentity).GetField("<connectionToServer>k__BackingField",
+                            BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (backingField != null)
+                        {
+                            backingField.SetValue(identity, NetworkClient.connection);
+                            Plugin.Log.LogInfo($"[DirectConnect] Set connectionToServer via backing field");
+                        }
+                        else
+                        {
+                            Plugin.Log.LogWarning($"[DirectConnect] Could not find connectionToServer setter or backing field");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[DirectConnect] TrySetConnectionToServer error: {ex.Message}");
             }
         }
 
