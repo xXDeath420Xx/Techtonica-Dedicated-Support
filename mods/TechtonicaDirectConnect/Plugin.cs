@@ -1063,7 +1063,7 @@ namespace TechtonicaDirectConnect
     {
         public const string PLUGIN_GUID = "com.certifried.techtonicadirectconnect";
         public const string PLUGIN_NAME = "Techtonica Direct Connect";
-        public const string PLUGIN_VERSION = "1.0.71";
+        public const string PLUGIN_VERSION = "1.0.73";
     }
 
     /// <summary>

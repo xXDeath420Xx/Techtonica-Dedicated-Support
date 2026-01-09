@@ -1,6 +1,6 @@
 {
     "name": "TechtonicaDirectConnect",
-    "version_number": "1.0.72",
+    "version_number": "1.0.73",
     "website_url": "https://github.com/xXDeath420Xx/Techtonica",
     "description": "Connect to Techtonica dedicated servers via direct IP. Bypass Steam lobbies and join 24/7 community servers!",
     "dependencies": [

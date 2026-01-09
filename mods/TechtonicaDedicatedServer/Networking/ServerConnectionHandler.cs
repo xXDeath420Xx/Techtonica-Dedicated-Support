@@ -283,9 +283,12 @@ namespace TechtonicaDedicatedServer.Networking
                 Plugin.Log.LogError("[ServerConnectionHandler] NetworkedPlayer type NOT FOUND!");
             }
 
-            // Also start InvokeRepeating as a backup for Update
-            InvokeRepeating(nameof(CheckConnectionsInvoke), 1f, 0.5f);
-            Plugin.Log.LogInfo("[ServerConnectionHandler] Started InvokeRepeating for connection checks");
+            // Start InvokeRepeating for connection checks AND transport ticking
+            // CRITICAL: Tick at 0.016s (60fps equivalent) for KCP to work properly
+            // KCP requires frequent ticking for connection handshake
+            InvokeRepeating(nameof(CheckConnectionsInvoke), 1f, 0.25f);
+            InvokeRepeating(nameof(TickTransportFast), 0.1f, 0.016f);  // 60fps transport tick
+            Plugin.Log.LogInfo("[ServerConnectionHandler] Started InvokeRepeating for connection checks (0.25s) and fast transport tick (0.016s)");
 
             // Register for authentication events to properly handle client auth
             RegisterAuthenticationHandler();
@@ -718,6 +721,38 @@ namespace TechtonicaDedicatedServer.Networking
         }
 
         private static int _tickCount;
+        private static int _fastTickCount;
+
+        /// <summary>
+        /// Fast transport tick - minimal overhead, called at 60fps equivalent.
+        /// This is critical for KCP to handle connection handshakes properly.
+        /// </summary>
+        private void TickTransportFast()
+        {
+            if (!NetworkServer.active) return;
+
+            var transport = Mirror.Transport.activeTransport;
+            if (transport == null) return;
+
+            _fastTickCount++;
+
+            // Log first tick and periodically
+            if (_fastTickCount == 1)
+            {
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] TickTransportFast FIRST CALL! Transport={transport.GetType().Name}");
+            }
+            else if (_fastTickCount % 3000 == 0) // Every ~50 seconds at 60fps
+            {
+                Plugin.Log.LogInfo($"[ServerConnectionHandler] TickTransportFast #{_fastTickCount}, connections={NetworkServer.connections.Count}");
+            }
+
+            try
+            {
+                transport.ServerEarlyUpdate();
+                transport.ServerLateUpdate();
+            }
+            catch { }
+        }
 
         /// <summary>
         /// Manually tick the transport and NetworkServer to process packets.
